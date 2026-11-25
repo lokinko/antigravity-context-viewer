@@ -444,12 +444,40 @@ function withFileLockSync(targetPath, fn, timeoutOrOptions = DEFAULT_FILE_LOCK_T
   }
 }
 
+function acquireFileLock(targetPath, timeoutOrOptions = DEFAULT_FILE_LOCK_TIMEOUT_MS) {
+  return acquireSyncFileLock(targetPath, timeoutOrOptions);
+}
+
+function getProjectVersion(fallback = '1.0.0') {
+  for (const pkgPath of [
+    path.join(__dirname, 'package.json'),
+    path.join(__dirname, '..', 'package.json')
+  ]) {
+    try {
+      if (fs.existsSync(pkgPath)) {
+        const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (
+          parsed &&
+          parsed.name === 'antigravity-context-viewer' &&
+          typeof parsed.version === 'string' &&
+          parsed.version.trim()
+        ) {
+          return parsed.version.trim();
+        }
+      }
+    } catch {}
+  }
+  return fallback;
+}
+
 module.exports = {
   safeWriteJsonSync,
   safeReadJsonSync,
   withFileLockSync,
   acquireSyncFileLock,
+  acquireFileLock,
   withFileLockAsync,
   acquireFileLockAsync,
-  parseLockFileMetadata
+  parseLockFileMetadata,
+  getProjectVersion
 };
