@@ -197,4 +197,125 @@ describe('meter-core', () => {
     assert.equal(daily.modelsByScope.all.length, 2);
     assert.equal(daily.days.length, 2);
   });
+
+  it('normalizes external JSONL usage and extracts deduplicated codex-api calls from steps', () => {
+    const normCached = core.normalizeExternalUsageRecord({
+      id: 'resp_cached_1',
+      source: 'codex-api',
+      model: 'codex/gpt-6.2-sol',
+      effort: 'high',
+      timestamp: '2026-11-25T12:00:00Z',
+      inputTokens: 10000,
+      cacheReadTokens: 4000,
+      outputTokens: 1200,
+      reasoningTokens: 300,
+      durationSec: 12.5,
+      inputIncludesCache: true
+    });
+    assert.equal(normCached.callId, 'ext:resp_cached_1');
+    assert.equal(normCached.isExternal, true);
+    assert.equal(normCached.uncachedInput, 6000);
+    assert.equal(normCached.cacheReadTokens, 4000);
+    assert.equal(normCached.totalInput, 10000);
+    assert.equal(normCached.totalTokens, 11200);
+    assert.equal(normCached.cacheReadPct, 40);
+
+    const normUncached = core.normalizeExternalUsageRecord({
+      callId: 'ext:resp_uncached_2',
+      source: 'codex-api',
+      model: 'codex/gpt-6.2-sol',
+      inputTokens: 2000,
+      cacheReadTokens: 3000,
+      outputTokens: 500,
+      inputIncludesCache: false
+    });
+    assert.equal(normUncached.totalInput, 5000);
+    assert.equal(normUncached.uncachedInput, 2000);
+    assert.equal(normUncached.totalTokens, 5500);
+
+    const steps = [
+      {
+        runCommand: {
+          commandLine: 'node codex_api.mjs --prompt hi',
+          combinedOutput: {
+            full: 'Answer line 1\n---\nresponse_id: resp_abc123456\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 15.2\nusage: in=12000 out=1500 reasoning=400\n'
+          }
+        },
+        metadata: { createdAt: '2026-11-24T10:00:00Z' }
+      },
+      {
+        // Echoed in a later plannerResponse on the next day: should deduplicate and keep earliest timestamp
+        plannerResponse: {
+          response: 'Result:\n---\nresponse_id: resp_abc123456\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 15.2\nusage: in=12000 out=1500 reasoning=400\n'
+        },
+        metadata: { createdAt: '2026-11-25T10:00:00Z' }
+      },
+      {
+        // Diff content must be ignored to avoid malformed JSON-escaped diff noise
+        codeAction: {
+          unifiedDiff: '---\nresponse_id: resp_fake_diff_999\nmodel: codex/gpt-6.2-sol","type":"DIFF"\nusage: in=999999 out=999\n'
+        },
+        metadata: { createdAt: '2026-11-25T11:00:00Z' }
+      }
+    ];
+
+    const extracted = core.extractExternalApiCallsFromSteps(steps);
+    assert.equal(extracted.length, 1);
+    assert.equal(extracted[0].callId, 'ext:resp_abc123456');
+    assert.equal(extracted[0].model, 'codex/gpt-6.2-sol');
+    assert.equal(extracted[0].dateKey, '2026-11-24');
+    assert.equal(extracted[0].totalInput, 12000);
+    assert.equal(extracted[0].outputTokens, 1500);
+    assert.equal(extracted[0].thinkingTokens, 400);
+    assert.equal(extracted[0].totalTokens, 13500);
+
+    const models = core.summarizeModelUsage(extracted);
+    assert.equal(models.length, 1);
+    assert.equal(models[0].isExternal, true);
+    assert.equal(models[0].source, 'codex-api');
+  });
+
+  it('parses 5h and weekly quota summary, matches model groups, and formats countdowns', () => {
+    assert.equal(core.formatCountdownSec(null), '—');
+    assert.equal(core.formatCountdownSec(45), '<1m');
+    assert.equal(core.formatCountdownSec(1500), '25m');
+    assert.equal(core.formatCountdownSec(9000), '2h 30m');
+    assert.equal(core.formatCountdownSec(6 * 86400 + 3600), '6d 1h');
+
+    const nowMs = Date.parse('2026-11-25T09:00:00Z');
+    const parsed = core.parseQuotaSummary({
+      response: {
+        groups: [
+          {
+            displayName: 'Gemini Models',
+            description: 'Gemini 4 Neon, Gemini 3.8 Flash',
+            buckets: [
+              { bucketId: 'gemini-weekly', displayName: 'Weekly Limit Remaining', window: 'weekly', remainingFraction: 0.6338, resetTime: '2026-12-01T09:00:00Z' },
+              { bucketId: 'gemini-5h', displayName: 'Five Hour Limit Remaining', window: '5h', remainingFraction: 0.4905, resetTime: '2026-11-25T11:30:00Z' }
+            ]
+          },
+          {
+            displayName: 'Claude and GPT models',
+            description: 'Claude Opus 5.5, Claude Sonnet 5.5',
+            buckets: [
+              { bucketId: '3p-weekly', displayName: 'Weekly Limit Remaining', window: 'weekly', remainingFraction: 0.5334, resetTime: '2026-12-01T10:00:00Z' },
+              { bucketId: '3p-5h', displayName: 'Five Hour Limit Remaining', window: '5h', remainingFraction: 1, resetTime: '2026-11-25T14:00:00Z' }
+            ]
+          }
+        ]
+      }
+    }, nowMs);
+
+    assert.equal(parsed.groups.length, 2);
+    assert.equal(parsed.groups[0].key, 'gemini');
+    assert.equal(parsed.groups[0].fiveHour.remainingPct, 49);
+    assert.equal(parsed.groups[0].fiveHour.resetInSec, 9000);
+    assert.equal(parsed.groups[0].weekly.remainingPct, 63.4);
+    assert.equal(parsed.groups[1].key, 'third_party');
+    assert.equal(parsed.groups[1].fiveHour.remainingPct, 100);
+
+    assert.equal(core.pickQuotaGroupForModel(parsed, 'Gemini 4 Neon (High)')?.key, 'gemini');
+    assert.equal(core.pickQuotaGroupForModel(parsed, 'Claude Opus 5.5 (High)')?.key, 'third_party');
+    assert.equal(core.pickQuotaGroupForModel(parsed, 'Unknown Model')?.key, 'gemini');
+  });
 });

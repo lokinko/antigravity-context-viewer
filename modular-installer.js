@@ -45,6 +45,7 @@ electron_1.contextBridge.exposeInMainWorld("contextMeterAPI", {
   scan: (id, force) => electron_1.ipcRenderer.invoke("context-meter:scan", id, force === true),
   getTurnState: (id) => electron_1.ipcRenderer.invoke("context-meter:turn-state", id),
   getDailyUsage: (force) => electron_1.ipcRenderer.invoke("context-meter:daily-usage", force === true),
+  getQuota: (force) => electron_1.ipcRenderer.invoke("context-meter:quota", force === true),
   getSettings: () => electron_1.ipcRenderer.invoke("context-meter:get-settings"),
   saveSettings: (payload) => electron_1.ipcRenderer.invoke("context-meter:save-settings", payload)
 });

@@ -4,11 +4,29 @@
       <circle class="ring-bg" cx="9" cy="9" r="7"></circle>
       <circle class="ring-fg" id="ring-fg" cx="9" cy="9" r="7" stroke-dasharray="43.98" stroke-dashoffset="43.98"></circle>
     </svg>
-    <span id="pill-pct">—</span>
+    <span id="pill-pct">context —</span>
     <span class="pill-sep" id="pill-sep-speed" hidden>·</span>
-    <span class="pill-chip" id="pill-speed" hidden></span>
+    <span class="pill-metric" id="pill-speed-wrap" hidden>
+      <svg class="pill-ico ico-speed" viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1.5L3.5 9H8l-1 5.5L12.5 7H8l1-5.5z"></path></svg>
+      <span class="pill-chip" id="pill-speed"></span>
+    </span>
     <span class="pill-sep" id="pill-sep-cache" hidden>·</span>
-    <span class="pill-chip" id="pill-cache" hidden></span>
+    <span class="pill-metric" id="pill-cache-wrap" hidden>
+      <svg class="pill-ico ico-cache" viewBox="0 0 16 16" aria-hidden="true"><ellipse cx="8" cy="4" rx="5" ry="2"></ellipse><path d="M3 4v4c0 1.1 2.24 2 5 2s5-.9 5-2V4"></path><path d="M3 8v4c0 1.1 2.24 2 5 2s5-.9 5-2V8"></path></svg>
+      <span class="pill-chip" id="pill-cache"></span>
+    </span>
+    <span class="pill-sep" id="pill-sep-quota" hidden>·</span>
+    <span class="pill-chip pill-quota" id="pill-quota" hidden>
+      <span class="pill-metric" id="pill-q5h-wrap" hidden>
+        <svg class="pill-ico ico-5h" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M8 4.5V8l2.5 1.5"></path></svg>
+        <span id="pill-q5h"></span>
+      </span>
+      <span class="pill-q-sep" id="pill-q-sep" hidden>·</span>
+      <span class="pill-metric" id="pill-qw-wrap" hidden>
+        <svg class="pill-ico ico-weekly" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3.5" width="11" height="10" rx="1.5"></rect><path d="M2.5 6.5h11M5.5 2v2.5M10.5 2v2.5"></path></svg>
+        <span id="pill-qw"></span>
+      </span>
+    </span>
   </button>
 
   <div class="panel" id="panel" hidden>
@@ -69,6 +87,14 @@
           <div class="mini-stat"><span class="k">累计输出</span><span class="v" id="st-out">—</span></div>
         </div>
         <div class="model-list compact" id="st-models" hidden></div>
+      </div>
+
+      <div class="card" id="quota-card" hidden>
+        <div class="card-title">
+          <span>账号额度余量 (5h / 周)</span>
+          <span id="quota-active-grp"></span>
+        </div>
+        <div class="quota-list" id="quota-list"></div>
       </div>
 
       <div class="grid-2">
@@ -187,6 +213,7 @@
       <div class="opts">
         <label class="opt"><input type="checkbox" id="opt-speed" checked />速度</label>
         <label class="opt"><input type="checkbox" id="opt-cache" checked />缓存</label>
+        <label class="opt"><input type="checkbox" id="opt-quota" checked />额度</label>
       </div>
     </div>
   </div>

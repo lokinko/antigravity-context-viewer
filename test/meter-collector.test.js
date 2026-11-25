@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('os');
 const path = require('path');
 
-const { collect, collectTurnState, collectDailyUsage, getSettings, saveSettings, clearCachesForTest } = require('../meter-collector');
+const { collect, collectTurnState, collectDailyUsage, collectQuotaSummary, getSettings, saveSettings, appendExternalUsageRecord, readExternalUsageLog, clearCachesForTest } = require('../meter-collector');
 
 describe('meter-collector', () => {
   let server;
@@ -232,5 +232,304 @@ describe('meter-collector', () => {
     const reloaded = getSettings({ stateDir: tmpDir });
     assert.equal(reloaded.settings.showCacheInPill, false);
     assert.equal(reloaded.settings.customBudget, 128000);
+  });
+
+  it('tracks external API calls from JSONL log and steps while JSONL takes precedence', async () => {
+    const extRes = appendExternalUsageRecord({
+      id: 'resp_ext_jsonl_1',
+      source: 'codex-api',
+      model: 'codex/gpt-6.2-sol',
+      effort: 'high',
+      timestamp: todayIso,
+      inputTokens: 4000,
+      cacheReadTokens: 6000,
+      outputTokens: 800,
+      thinkingTokens: 200,
+      durationSec: 8.5,
+      inputIncludesCache: false
+    }, { stateDir: tmpDir });
+    assert.equal(extRes.ok, true);
+    const logEntries = readExternalUsageLog({ stateDir: tmpDir });
+    assert.equal(logEntries.length, 1);
+    assert.equal(logEntries[0].totalTokens, 10800);
+
+    // Override conversation 1 response or just verify daily merge with JSONL + no host
+    const dailyNoHost = await collectDailyUsage(null, { stateDir: tmpDir });
+    assert.equal(dailyNoHost.today.totalTokens, 10800);
+    assert.equal(dailyNoHost.modelsByScope.today[0].model, 'codex/gpt-6.2-sol');
+    assert.equal(dailyNoHost.modelsByScope.today[0].isExternal, true);
+
+    // Test JSONL overriding step-extracted record for same response_id, plus session merge
+    const stepServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<script>window.__APP_CONFIG__ = ${JSON.stringify({ csrfToken: 'tok-ext' })};</script>`);
+        return;
+      }
+      if (req.method === 'POST' && req.url.startsWith('/exa.language_server_pb.LanguageServerService/')) {
+        const method = req.url.split('/').pop();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (method === 'GetAllCascadeTrajectories') {
+          res.end(JSON.stringify({
+            trajectorySummaries: {
+              [cascadeId]: { status: 'CASCADE_RUN_STATUS_IDLE', stepCount: 2, createdTime: todayIso, lastModifiedTime: todayIso }
+            }
+          }));
+        } else if (method === 'GetCascadeTrajectory') {
+          res.end(JSON.stringify({
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            lastModifiedTime: todayIso,
+            numTotalSteps: 2,
+            numTotalGeneratorMetadata: 1,
+            trajectory: {
+              steps: [
+                { userInput: { userResponse: 'run codex' }, metadata: { createdAt: todayIso } },
+                {
+                  runCommand: {
+                    output: '---\nresponse_id: resp_ext_jsonl_1\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 8.5\nusage: in=10000 out=800 reasoning=200\n' +
+                            '\n---\nresponse_id: resp_ext_step_only\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 5.0\nusage: in=2000 out=500 reasoning=100\n'
+                  },
+                  metadata: { createdAt: todayIso }
+                }
+              ]
+            }
+          }));
+        } else if (method === 'GetCascadeTrajectorySteps') {
+          res.end(JSON.stringify({
+            steps: [
+              { userInput: { userResponse: 'run codex' }, metadata: { createdAt: todayIso } },
+              {
+                runCommand: {
+                  output: '---\nresponse_id: resp_ext_jsonl_1\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 8.5\nusage: in=10000 out=800 reasoning=200\n' +
+                          '\n---\nresponse_id: resp_ext_step_only\nmodel: codex/gpt-6.2-sol\neffort: high\nelapsed_s: 5.0\nusage: in=2000 out=500 reasoning=100\n'
+                },
+                metadata: { createdAt: todayIso }
+              }
+            ]
+          }));
+        } else if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+          res.end(JSON.stringify({
+            numTotalGeneratorMetadata: 1,
+            generatorMetadata: [
+              {
+                invocationId: 'native-1',
+                stepIndices: [0],
+                chatModel: {
+                  modelDisplayName: 'Gemini Pro',
+                  usage: { inputTokens: 1000, cacheReadTokens: 3000, outputTokens: 100 },
+                  chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 100000 } }
+                }
+              }
+            ]
+          }));
+        } else {
+          res.end('{}');
+        }
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise(r => stepServer.listen(0, '127.0.0.1', r));
+    const extOrigin = `http://127.0.0.1:${stepServer.address().port}`;
+    try {
+      const col = await collect(extOrigin, cascadeId, { force: true, stateDir: tmpDir });
+      // Context window stays strictly on native Antigravity model (4100), not polluted by external calls
+      assert.equal(col.latest.actual, 4100);
+      // Session totals & models include native + both external calls (1 deduplicated via JSONL + 1 step-only)
+      assert.equal(col.sessionTotals.callCount, 3);
+      assert.equal(col.sessionTotals.totalTokens, 4100 + 10800 + 2500);
+      const codexModel = col.sessionModels.find(m => m.model === 'codex/gpt-6.2-sol');
+      assert.ok(codexModel);
+      assert.equal(codexModel.isExternal, true);
+      assert.equal(codexModel.callCount, 2);
+      // JSONL cacheReadTokens=6000 must override step-only cacheReadTokens=0 for resp_ext_jsonl_1
+      assert.equal(codexModel.cacheRead, 6000);
+
+      const daily = await collectDailyUsage(extOrigin, { force: true, stateDir: tmpDir });
+      const dailyCodex = daily.modelsByScope.today.find(m => m.model === 'codex/gpt-6.2-sol');
+      assert.equal(dailyCodex.callCount, 2);
+      assert.equal(dailyCodex.cacheRead, 6000);
+    } finally {
+      await new Promise(r => stepServer.close(r));
+    }
+  });
+
+  it('short-circuits idle collectTurnState, incrementally reads JSONL, and incrementally fetches collect()', async () => {
+    const rpcCounts = { GetAllCascadeTrajectories: 0, GetCascadeTrajectory: 0, GetCascadeTrajectorySteps: 0, GetCascadeTrajectoryGeneratorMetadata: 0 };
+    let curSteps = [
+      { userInput: { userResponse: 'step 0' }, metadata: { createdAt: todayIso } },
+      { plannerResponse: { response: 'reply 1' }, metadata: { createdAt: todayIso } },
+      { userInput: { userResponse: 'step 2' }, metadata: { createdAt: todayIso } },
+      { plannerResponse: { response: 'reply 3' }, metadata: { createdAt: todayIso } }
+    ];
+    let curGm = [
+      { invocationId: 'g0', stepIndices: [1], chatModel: { modelDisplayName: 'Gemini Pro', usage: { inputTokens: 1000, cacheReadTokens: 1000, outputTokens: 100 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 100000 } } } },
+      { invocationId: 'g1', stepIndices: [3], chatModel: { modelDisplayName: 'Gemini Pro', usage: { inputTokens: 1000, cacheReadTokens: 2000, outputTokens: 100 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 100000 } } } }
+    ];
+    let curMod = '2026-11-25T10:00:00Z';
+    const stepOffsetsSeen = [];
+
+    const perfServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<script>window.__APP_CONFIG__ = ${JSON.stringify({ csrfToken: 'tok-perf' })};</script>`);
+        return;
+      }
+      if (req.method === 'POST' && req.url.startsWith('/exa.language_server_pb.LanguageServerService/')) {
+        const method = req.url.split('/').pop();
+        if (rpcCounts[method] !== undefined) rpcCounts[method]++;
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          if (method === 'GetAllCascadeTrajectories') {
+            res.end(JSON.stringify({
+              trajectorySummaries: {
+                [cascadeId]: { status: 'CASCADE_RUN_STATUS_IDLE', stepCount: curSteps.length, createdTime: todayIso, lastModifiedTime: curMod }
+              }
+            }));
+          } else if (method === 'GetCascadeTrajectory') {
+            if (Number(parsed.trajectoryVerbosity) === 0) {
+              res.end(JSON.stringify({
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: curMod,
+                numTotalSteps: curSteps.length,
+                numTotalGeneratorMetadata: curGm.length
+              }));
+            } else {
+              res.end(JSON.stringify({
+                status: 'CASCADE_RUN_STATUS_IDLE',
+                lastModifiedTime: curMod,
+                numTotalSteps: curSteps.length,
+                numTotalGeneratorMetadata: curGm.length,
+                trajectory: { steps: curSteps, generatorMetadata: curGm }
+              }));
+            }
+          } else if (method === 'GetCascadeTrajectorySteps') {
+            const off = Number(parsed.stepOffset || 0);
+            stepOffsetsSeen.push(off);
+            res.end(JSON.stringify({ steps: curSteps.slice(off) }));
+          } else if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+            const off = Number(parsed.generatorMetadataOffset || 0);
+            res.end(JSON.stringify({ numTotalGeneratorMetadata: curGm.length, generatorMetadata: curGm.slice(off) }));
+          } else {
+            res.end('{}');
+          }
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise(r => perfServer.listen(0, '127.0.0.1', r));
+    const perfOrigin = `http://127.0.0.1:${perfServer.address().port}`;
+    try {
+      // 1. Cold vs cached collectTurnState short-circuit
+      const ts1 = await collectTurnState(perfOrigin, cascadeId);
+      assert.equal(ts1.stepCount, 4);
+      assert.equal(ts1.lastModifiedTime, curMod);
+      assert.equal(rpcCounts.GetCascadeTrajectorySteps, 1);
+      assert.equal(rpcCounts.GetCascadeTrajectoryGeneratorMetadata, 1);
+
+      const ts2 = await collectTurnState(perfOrigin, cascadeId);
+      assert.equal(ts2.cached, true);
+      assert.equal(rpcCounts.GetCascadeTrajectorySteps, 1);
+      assert.equal(rpcCounts.GetCascadeTrajectoryGeneratorMetadata, 1);
+
+      // 2. Cold collect + incremental collect when conversation grows by 1 step + 1 gm
+      const c1 = await collect(perfOrigin, cascadeId, { force: true, stateDir: tmpDir });
+      assert.equal(c1.sessionTotals.callCount, 2);
+      assert.equal(c1.session.steps, 4);
+
+      curSteps.push({ plannerResponse: { response: 'reply 4' }, metadata: { createdAt: todayIso } });
+      curGm.push({ invocationId: 'g2', stepIndices: [4], chatModel: { modelDisplayName: 'Gemini Pro', usage: { inputTokens: 500, cacheReadTokens: 3000, outputTokens: 200 } } });
+      curMod = '2026-11-25T10:01:00Z';
+
+      // collectTurnState wakes up on changed stepCount/lastModifiedTime
+      const ts3 = await collectTurnState(perfOrigin, cascadeId);
+      assert.equal(ts3.cached, undefined);
+      assert.equal(ts3.stepCount, 5);
+      assert.equal(rpcCounts.GetCascadeTrajectorySteps, 2);
+
+      stepOffsetsSeen.length = 0;
+      const c2 = await collect(perfOrigin, cascadeId, { force: true, stateDir: tmpDir });
+      assert.equal(c2.session.steps, 5);
+      assert.equal(c2.sessionTotals.callCount, 3);
+      assert.equal(c2.sessionTotals.totalTokens, 5200 + 3700);
+      assert.equal(stepOffsetsSeen.includes(2), true);
+
+      // 3. Incremental JSONL reading across appends
+      appendExternalUsageRecord({ id: 'inc_1', model: 'codex/gpt-6.2-sol', inputTokens: 100, outputTokens: 50, timestamp: todayIso }, { stateDir: tmpDir });
+      assert.equal(readExternalUsageLog({ stateDir: tmpDir }).length, 1);
+      assert.equal(readExternalUsageLog({ stateDir: tmpDir }).length, 1);
+      appendExternalUsageRecord({ id: 'inc_2', model: 'codex/gpt-6.2-sol', inputTokens: 200, outputTokens: 80, timestamp: todayIso }, { stateDir: tmpDir });
+      const logs = readExternalUsageLog({ stateDir: tmpDir });
+      assert.equal(logs.length, 2);
+      assert.equal(logs[1].totalTokens, 280);
+    } finally {
+      await new Promise(r => perfServer.close(r));
+    }
+  });
+
+  it('collects and caches 5h/weekly quota summary and persists showQuotaInPill setting', async () => {
+    let quotaRpcCount = 0;
+    const quotaServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<script>window.__APP_CONFIG__ = ${JSON.stringify({ csrfToken: 'tok-q' })};</script>`);
+        return;
+      }
+      if (req.method === 'POST' && req.url.startsWith('/exa.language_server_pb.LanguageServerService/')) {
+        const method = req.url.split('/').pop();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (method === 'RetrieveUserQuotaSummary') {
+          quotaRpcCount++;
+          res.end(JSON.stringify({
+            response: {
+              groups: [
+                {
+                  displayName: 'Gemini Models',
+                  buckets: [
+                    { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.72, resetTime: new Date(Date.now() + 3600 * 1000).toISOString() },
+                    { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.45, resetTime: new Date(Date.now() + 1800 * 1000).toISOString() }
+                  ]
+                }
+              ]
+            }
+          }));
+        } else {
+          res.end('{}');
+        }
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise(r => quotaServer.listen(0, '127.0.0.1', r));
+    const qOrigin = `http://127.0.0.1:${quotaServer.address().port}`;
+    try {
+      const q1 = await collectQuotaSummary(qOrigin);
+      assert.equal(q1.ok, true);
+      assert.equal(q1.groups[0].fiveHour.remainingPct, 45);
+      assert.equal(q1.groups[0].weekly.remainingPct, 72);
+      assert.equal(quotaRpcCount, 1);
+
+      const q2 = await collectQuotaSummary(qOrigin);
+      assert.equal(q2.groups[0].fiveHour.remainingPct, 45);
+      assert.equal(quotaRpcCount, 1);
+
+      const q3 = await collectQuotaSummary(qOrigin, { force: true });
+      assert.equal(q3.ok, true);
+      assert.equal(quotaRpcCount, 2);
+
+      const s1 = getSettings({ stateDir: tmpDir });
+      assert.equal(s1.settings.showQuotaInPill, true);
+      const s2 = saveSettings({ showQuotaInPill: false }, { stateDir: tmpDir });
+      assert.equal(s2.settings.showQuotaInPill, false);
+    } finally {
+      await new Promise(r => quotaServer.close(r));
+    }
   });
 });

@@ -4,6 +4,7 @@
  * 专注：通过本机 LanguageServerService RPC 拉取会话上下文、生成速度、TTFT、缓存命中与每日用量。
  */
 
+const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -25,18 +26,32 @@ const {
   summarizeDailyUsage,
   formatLocalDateKey,
   parseGeneratorCall,
+  normalizeExternalUsageRecord,
+  extractExternalApiCallsFromSteps,
+  parseQuotaSummary,
   isCheckpointNewerThanGenerator,
   buildPostCompactSummary
 } = require('./meter-core');
 
 const PROJECT_VERSION = getProjectVersion('1.0.0');
 const CONVERSATIONS_CACHE_MAX_ENTRIES = 32;
+const TURN_STATE_CACHE_MAX_ENTRIES = 32;
+const INCREMENTAL_COLLECT_MAX_ENTRIES = 3;
 const CACHE_TTL_MS = 8000;
+const QUOTA_TTL_MS = 60000;
 const DAILY_SYNC_TTL_MS = 30000;
+const LEDGER_WRITE_DEBOUNCE_MS = 400;
 const conversations = new Map();
 const csrfTokenByOrigin = new Map();
 const latestCollectSeqByOrigin = new Map();
 const _turnStateGmCountCache = new Map();
+const _turnStateCache = new Map();
+const _incrementalCollectCache = new Map();
+const _extLogCache = new Map();
+const _ledgerCache = new Map();
+const _ledgerWriteTimers = new Map();
+const _ledgerDirtyData = new Map();
+const _quotaCache = new Map();
 const _lastDailySyncAt = new Map();
 let collectSeqCounter = 0;
 let collectTaskSeq = 0;
@@ -182,8 +197,9 @@ function resolveStepDate(stepDates, stepIndex, fallbackDate = null) {
   return fallbackDate;
 }
 
-async function fetchStepTimestampsMap(call, cascadeId, expectedSteps = 0) {
+async function fetchTrajectoryStepsMeta(call, cascadeId, expectedSteps = 0, fallbackDate = null) {
   const stepDates = new Map();
+  const allSteps = [];
   let offset = 0;
   const limit = Number.isFinite(Number(expectedSteps)) && Number(expectedSteps) > 0 ? Number(expectedSteps) : Infinity;
   while (offset < limit) {
@@ -196,6 +212,7 @@ async function fetchStepTimestampsMap(call, cascadeId, expectedSteps = 0) {
     if (!list.length) break;
     for (let i = 0; i < list.length; i++) {
       const s = list[i];
+      allSteps.push(s);
       const rawIdx = s?.metadata?.sourceTrajectoryStepInfo?.stepIndex;
       const gIdx = (rawIdx !== undefined && rawIdx !== null && rawIdx !== '' && Number.isInteger(Number(rawIdx)) && Number(rawIdx) >= 0)
         ? Number(rawIdx)
@@ -206,7 +223,116 @@ async function fetchStepTimestampsMap(call, cascadeId, expectedSteps = 0) {
     offset += list.length;
     if (limit === Infinity) break;
   }
-  return stepDates;
+  const externalCalls = extractExternalApiCallsFromSteps(allSteps, { fallbackDate });
+  return { stepDates, externalCalls };
+}
+
+function getExternalUsageLogPath(options = {}) {
+  const dir = options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();
+  return path.join(dir, 'external-api-usage.jsonl');
+}
+
+function ingestExternalLogChunk(chunkText, prevRemainder, dedupMap, fallbackDate) {
+  const combined = (prevRemainder || '') + chunkText;
+  const endsWithNewline = combined.endsWith('\n') || combined.endsWith('\r');
+  const lines = combined.split(/\r?\n/);
+  const remainder = endsWithNewline ? '' : (lines.pop() || '');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      const rec = normalizeExternalUsageRecord(obj, { sourceType: 'jsonl', fallbackDate });
+      if (rec) dedupMap.set(rec.callId, rec);
+    } catch {}
+  }
+  return remainder;
+}
+
+function readExternalUsageLog(options = {}) {
+  const logPath = getExternalUsageLogPath(options);
+  try {
+    let st;
+    try {
+      st = fs.statSync(logPath);
+    } catch {
+      _extLogCache.delete(logPath);
+      return [];
+    }
+    const cached = _extLogCache.get(logPath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      return cached.records;
+    }
+
+    if (cached && st.size > cached.offset) {
+      const delta = st.size - cached.offset;
+      const buf = Buffer.alloc(delta);
+      let totalRead = 0;
+      const fd = fs.openSync(logPath, 'r');
+      try {
+        while (totalRead < delta) {
+          const n = fs.readSync(fd, buf, totalRead, delta - totalRead, cached.offset + totalRead);
+          if (n <= 0) break;
+          totalRead += n;
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+      const chunkText = buf.subarray(0, totalRead).toString('utf8');
+      cached.remainder = ingestExternalLogChunk(chunkText, cached.remainder, cached.dedupMap, options.fallbackDate);
+      cached.records = Array.from(cached.dedupMap.values());
+      cached.offset = cached.offset + totalRead;
+      cached.size = st.size;
+      cached.mtimeMs = st.mtimeMs;
+      return cached.records;
+    }
+
+    const content = fs.readFileSync(logPath, 'utf8');
+    if (!content) {
+      const emptyEntry = { mtimeMs: st.mtimeMs, size: st.size, offset: st.size, remainder: '', dedupMap: new Map(), records: [] };
+      _extLogCache.set(logPath, emptyEntry);
+      return emptyEntry.records;
+    }
+    const dedupMap = new Map();
+    const remainder = ingestExternalLogChunk(content, '', dedupMap, options.fallbackDate);
+    const records = Array.from(dedupMap.values());
+    _extLogCache.set(logPath, { mtimeMs: st.mtimeMs, size: st.size, offset: st.size, remainder, dedupMap, records });
+    return records;
+  } catch {
+    return [];
+  }
+}
+
+function appendExternalUsageRecord(record, options = {}) {
+  const rec = normalizeExternalUsageRecord(record, {
+    sourceType: 'jsonl',
+    fallbackDate: options.fallbackDate
+  });
+  if (!rec) {
+    return { ok: false, error: '无效的外部用量记录' };
+  }
+  const logPath = getExternalUsageLogPath(options);
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, JSON.stringify({
+      id: rec.callId,
+      source: rec.source,
+      model: rec.model,
+      effort: rec.effort,
+      date: rec.dateKey,
+      timestamp: rec.timestampMs ? new Date(rec.timestampMs).toISOString() : new Date().toISOString(),
+      inputTokens: rec.uncachedInput,
+      cacheReadTokens: rec.cacheReadTokens,
+      cacheWriteTokens: rec.cacheWriteTokens,
+      outputTokens: rec.outputTokens,
+      thinkingTokens: rec.thinkingTokens,
+      durationSec: rec.durationSec,
+      inputIncludesCache: false
+    }) + '\n', 'utf8');
+    return { ok: true, record: rec, path: logPath };
+  } catch (err) {
+    return { ok: false, error: err?.message || '写入外部用量日志失败', path: logPath };
+  }
 }
 
 function resolveLatestAndCalls(gmRows, id, session, options = {}) {
@@ -284,10 +410,19 @@ function shouldSkipAutoLedgerWrite(options = {}) {
   return Boolean(process.env.NODE_TEST_CONTEXT || process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test');
 }
 
-const LEDGER_VERSION = 2;
+const LEDGER_VERSION = 3;
 
 function loadLedger(options = {}) {
   const p = getLedgerPath(options);
+  const cached = _ledgerCache.get(p);
+  if (cached?.dirty && Number(cached.data?.version) >= LEDGER_VERSION) {
+    return { path: p, data: cached.data, migrated: false };
+  }
+  let st = null;
+  try { st = fs.statSync(p); } catch {}
+  if (st && cached && !cached.dirty && cached.mtimeMs === st.mtimeMs && cached.size === st.size && Number(cached.data?.version) >= LEDGER_VERSION) {
+    return { path: p, data: cached.data, migrated: false };
+  }
   const emptyLedger = { version: LEDGER_VERSION, syncedTrajectories: {}, calls: {} };
   const res = safeReadJsonSync(p, emptyLedger);
   const data = res?.data && typeof res.data === 'object' ? res.data : emptyLedger;
@@ -296,7 +431,79 @@ function loadLedger(options = {}) {
   }
   if (!data.syncedTrajectories || typeof data.syncedTrajectories !== 'object') data.syncedTrajectories = {};
   if (!data.calls || typeof data.calls !== 'object') data.calls = {};
+  _ledgerCache.set(p, { mtimeMs: st?.mtimeMs ?? -1, size: st?.size ?? -1, data, dirty: false });
   return { path: p, data, migrated: false };
+}
+
+function flushPendingLedgersSync() {
+  for (const timer of _ledgerWriteTimers.values()) {
+    try { clearTimeout(timer); } catch {}
+  }
+  _ledgerWriteTimers.clear();
+  for (const [ledgerPath, data] of _ledgerDirtyData.entries()) {
+    try {
+      const res = safeWriteJsonSync(ledgerPath, data);
+      if (res?.ok) {
+        let st = null;
+        try { st = fs.statSync(ledgerPath); } catch {}
+        _ledgerCache.set(ledgerPath, { mtimeMs: st?.mtimeMs ?? -1, size: st?.size ?? -1, data, dirty: false });
+      }
+    } catch {}
+  }
+  _ledgerDirtyData.clear();
+}
+
+if (typeof process !== 'undefined' && typeof process.once === 'function') {
+  process.once('beforeExit', flushPendingLedgersSync);
+}
+
+function persistLedger(ledgerPath, data, options = {}) {
+  _ledgerCache.set(ledgerPath, { mtimeMs: -1, size: -1, data, dirty: true });
+  const isSyncMode = options.syncWrite === true || Boolean(
+    process.env.NODE_TEST_CONTEXT || process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test'
+  );
+  if (isSyncMode) {
+    const prevTimer = _ledgerWriteTimers.get(ledgerPath);
+    if (prevTimer) {
+      try { clearTimeout(prevTimer); } catch {}
+      _ledgerWriteTimers.delete(ledgerPath);
+    }
+    _ledgerDirtyData.delete(ledgerPath);
+    const res = safeWriteJsonSync(ledgerPath, data);
+    if (res?.ok) {
+      let st = null;
+      try { st = fs.statSync(ledgerPath); } catch {}
+      _ledgerCache.set(ledgerPath, { mtimeMs: st?.mtimeMs ?? -1, size: st?.size ?? -1, data, dirty: false });
+    }
+    return;
+  }
+
+  _ledgerDirtyData.set(ledgerPath, data);
+  const prevTimer = _ledgerWriteTimers.get(ledgerPath);
+  if (prevTimer) {
+    try { clearTimeout(prevTimer); } catch {}
+  }
+  const timer = setTimeout(async () => {
+    _ledgerWriteTimers.delete(ledgerPath);
+    const targetData = _ledgerDirtyData.get(ledgerPath);
+    if (!targetData) return;
+    const tmpPath = `${ledgerPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await fs.promises.mkdir(path.dirname(ledgerPath), { recursive: true });
+      await fs.promises.writeFile(tmpPath, JSON.stringify(targetData), 'utf8');
+      await fs.promises.rename(tmpPath, ledgerPath);
+      if (_ledgerDirtyData.get(ledgerPath) === targetData) {
+        _ledgerDirtyData.delete(ledgerPath);
+        let st = null;
+        try { st = await fs.promises.stat(ledgerPath); } catch {}
+        _ledgerCache.set(ledgerPath, { mtimeMs: st?.mtimeMs ?? -1, size: st?.size ?? -1, data: targetData, dirty: false });
+      }
+    } catch {
+      try { await fs.promises.rm(tmpPath, { force: true }); } catch {}
+    }
+  }, LEDGER_WRITE_DEBOUNCE_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  _ledgerWriteTimers.set(ledgerPath, timer);
 }
 
 function mergeCallsIntoLedger(ledgerData, calls = [], fallbackDate = null) {
@@ -313,6 +520,9 @@ function mergeCallsIntoLedger(ledgerData, calls = [], fallbackDate = null) {
     if (total <= 0) continue;
 
     const existing = ledgerData.calls[c.callId];
+    if (existing?.sourceType === 'jsonl' && c.sourceType === 'step') {
+      continue;
+    }
     const date = c.dateKey || existing?.date || fallbackKey;
     const next = {
       date,
@@ -324,6 +534,11 @@ function mergeCallsIntoLedger(ledgerData, calls = [], fallbackDate = null) {
       totalTokens: total,
       model: c.model || existing?.model || ''
     };
+    if (c.isExternal || existing?.isExternal) {
+      next.isExternal = true;
+      next.source = c.source || existing?.source || 'external-api';
+      next.sourceType = c.sourceType || existing?.sourceType || 'step';
+    }
     if (
       !existing ||
       existing.date !== next.date ||
@@ -332,7 +547,10 @@ function mergeCallsIntoLedger(ledgerData, calls = [], fallbackDate = null) {
       existing.cacheReadTokens !== next.cacheReadTokens ||
       existing.outputTokens !== next.outputTokens ||
       existing.thinkingTokens !== next.thinkingTokens ||
-      existing.model !== next.model
+      existing.model !== next.model ||
+      Boolean(existing.isExternal) !== Boolean(next.isExternal) ||
+      (existing.source || null) !== (next.source || null) ||
+      (existing.sourceType || null) !== (next.sourceType || null)
     ) {
       ledgerData.calls[c.callId] = next;
       changed = true;
@@ -346,7 +564,7 @@ function recordCallsToLedger(calls = [], options = {}) {
   const { path: ledgerPath, data } = loadLedger(options);
   const changed = mergeCallsIntoLedger(data, calls, options.fallbackDate);
   if (changed) {
-    safeWriteJsonSync(ledgerPath, data);
+    persistLedger(ledgerPath, data, options);
   }
   return { ok: true, changed, path: ledgerPath };
 }
@@ -357,6 +575,12 @@ async function collectDailyUsage(origin = null, options = {}) {
   const syncKey = `${safeOrigin || ''}|${ledgerPath}`;
   const lastSync = _lastDailySyncAt.get(syncKey) || 0;
   const shouldSyncHost = Boolean(safeOrigin && (options.force === true || migrated || Date.now() - lastSync > DAILY_SYNC_TTL_MS));
+
+  let ledgerChanged = Boolean(migrated);
+  const jsonlExternalCalls = readExternalUsageLog(options);
+  if (jsonlExternalCalls.length > 0 && mergeCallsIntoLedger(ledger, jsonlExternalCalls)) {
+    ledgerChanged = true;
+  }
 
   if (shouldSyncHost) {
     try {
@@ -370,7 +594,6 @@ async function collectDailyUsage(origin = null, options = {}) {
         .sort((a, b) => (parseTimestampMs(b[1]?.lastModifiedTime || b[1]?.createdTime) || 0) - (parseTimestampMs(a[1]?.lastModifiedTime || a[1]?.createdTime) || 0))
         .slice(0, 50);
 
-      let changed = Boolean(migrated);
       for (const [cid, summary] of entries) {
         const stepCount = Number(summary?.stepCount ?? 0);
         const updatedAt = String(summary?.lastModifiedTime || summary?.createdTime || '');
@@ -395,17 +618,17 @@ async function collectDailyUsage(origin = null, options = {}) {
             if (allRows) gmRows = allRows;
           }
 
-          const createdKey = formatLocalDateKey(summary?.createdTime);
-          const modifiedKey = formatLocalDateKey(summary?.lastModifiedTime);
-          const isSingleDay = Boolean(createdKey && modifiedKey && createdKey === modifiedKey);
+          const defaultDate = summary?.createdTime || updatedAt || new Date().toISOString();
           let stepDates = null;
-          if (!isSingleDay && gmRows.length > 0) {
+          let stepExternalCalls = [];
+          if (stepCount > 0) {
             try {
-              stepDates = await fetchStepTimestampsMap(call, cid, stepCount);
+              const meta = await fetchTrajectoryStepsMeta(call, cid, stepCount, defaultDate);
+              stepDates = meta.stepDates;
+              stepExternalCalls = meta.externalCalls || [];
             } catch {}
           }
 
-          const defaultDate = summary?.createdTime || updatedAt || new Date().toISOString();
           const parsed = [];
           for (let i = 0; i < gmRows.length; i++) {
             const row = gmRows[i];
@@ -417,17 +640,19 @@ async function collectDailyUsage(origin = null, options = {}) {
             const c = parseGeneratorCall(row, cid, i, { fallbackDate: callFallback });
             if (c) parsed.push(c);
           }
-          if (mergeCallsIntoLedger(ledger, parsed, defaultDate)) changed = true;
+          const combinedCalls = stepExternalCalls.length ? [...parsed, ...stepExternalCalls] : parsed;
+          if (mergeCallsIntoLedger(ledger, combinedCalls, defaultDate)) ledgerChanged = true;
           ledger.syncedTrajectories[cid] = { stepCount, updatedAt };
-          changed = true;
+          ledgerChanged = true;
         } catch {}
       }
 
-      if (changed) {
-        safeWriteJsonSync(ledgerPath, ledger);
-      }
       _lastDailySyncAt.set(syncKey, Date.now());
     } catch {}
+  }
+
+  if (ledgerChanged) {
+    persistLedger(ledgerPath, ledger, options);
   }
 
   return {
@@ -436,6 +661,78 @@ async function collectDailyUsage(origin = null, options = {}) {
     ...summarizeDailyUsage(Object.values(ledger.calls), options),
     syncedAt: Date.now()
   };
+}
+
+async function loadTrajectoryStepsAndGm(call, id, inc, force, isSuperseded) {
+  if (inc && Array.isArray(inc.rawSteps) && Array.isArray(inc.rawGmRows)) {
+    const head = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 0 });
+    if (!head || isSuperseded()) return { aborted: true };
+    const expSteps = Number(head.numTotalSteps ?? 0);
+    const expGm = Number(head.numTotalGeneratorMetadata ?? 0);
+    const headMod = head.lastModifiedTime || null;
+    const headStatus = head.status || null;
+    if (!force && expSteps === inc.rawSteps.length && expGm === inc.rawGmRows.length && headMod === inc.lastModifiedTime && headStatus === inc.cascadeStatus) {
+      return { unchangedResult: inc.result };
+    }
+    if (inc.rawSteps.length > 0 && expSteps >= inc.rawSteps.length && expGm >= inc.rawGmRows.length) {
+      const stepStart = Math.max(0, inc.rawSteps.length - 2);
+      const gmStart = Math.max(0, inc.rawGmRows.length - 2);
+      const tailSteps = [];
+      let sCur = stepStart;
+      while (sCur < expSteps) {
+        if (isSuperseded()) return { aborted: true };
+        const page = await call('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: sCur, trajectoryVerbosity: 3 });
+        const batch = Array.isArray(page?.steps) ? page.steps : [];
+        if (!batch.length) break;
+        tailSteps.push(...batch);
+        sCur += batch.length;
+      }
+      const tailGm = [];
+      let gmCur = gmStart;
+      while (gmCur < expGm) {
+        if (isSuperseded()) return { aborted: true };
+        const gp = await call('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: id, generatorMetadataOffset: gmCur, includeMessages: false });
+        const batch = Array.isArray(gp?.generatorMetadata) ? gp.generatorMetadata : [];
+        if (!batch.length) break;
+        tailGm.push(...batch);
+        gmCur += batch.length;
+      }
+      if (!isSuperseded() && (stepStart + tailSteps.length) >= expSteps && (gmStart + tailGm.length) >= expGm) {
+        return {
+          full: head,
+          steps: [...inc.rawSteps.slice(0, stepStart), ...tailSteps],
+          gmRows: [...inc.rawGmRows.slice(0, gmStart), ...tailGm],
+          totalGm: expGm
+        };
+      }
+    }
+  }
+
+  const full = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 3 });
+  if (!full || isSuperseded()) return { aborted: true };
+  const trajectory = full.trajectory;
+  if (!trajectory) throw new Error('未取得会话历史，无法统计');
+
+  const steps = Array.isArray(trajectory.steps) ? trajectory.steps.slice() : [];
+  const expected = Number(full.numTotalSteps ?? steps.length);
+  while (steps.length < expected) {
+    if (isSuperseded()) return { aborted: true };
+    const page = await call('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: steps.length, trajectoryVerbosity: 3 });
+    if (!page?.steps?.length) break;
+    steps.push(...page.steps);
+  }
+  if (isSuperseded()) return { aborted: true };
+
+  const totalGm = Number(full.numTotalGeneratorMetadata ?? trajectory.generatorMetadata?.length ?? 0);
+  const gmRows = await fetchAllGeneratorMetadata(
+    call,
+    id,
+    totalGm,
+    Array.isArray(trajectory.generatorMetadata) ? trajectory.generatorMetadata : [],
+    isSuperseded
+  );
+  if (gmRows === null || isSuperseded()) return { aborted: true };
+  return { full, steps, gmRows, totalGm };
 }
 
 async function collect(origin, id, options = {}) {
@@ -472,36 +769,21 @@ async function collect(origin, id, options = {}) {
     const signal = abortController?.signal || null;
     try {
       const call = createOriginCaller(origin, signal, options, isSuperseded);
-      const full = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 3 });
-      if (!full || isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now() };
-      const trajectory = full.trajectory;
-      if (!trajectory) throw new Error('未取得会话历史，无法统计');
-
-      const steps = Array.isArray(trajectory.steps) ? trajectory.steps.slice() : [];
-      const expected = Number(full.numTotalSteps ?? steps.length);
-      while (steps.length < expected) {
-        if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now() };
-        const page = await call('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: steps.length, trajectoryVerbosity: 3 });
-        if (!page?.steps?.length) break;
-        steps.push(...page.steps);
+      const inc = _incrementalCollectCache.get(key) || null;
+      const loaded = await loadTrajectoryStepsAndGm(call, id, inc, options.force === true, isSuperseded);
+      if (loaded.aborted || isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now() };
+      if (loaded.unchangedResult) {
+        setBoundedMap(conversations, key, { result: loaded.unchangedResult, at: Date.now(), taskSeq }, CONVERSATIONS_CACHE_MAX_ENTRIES);
+        return loaded.unchangedResult;
       }
-      if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now() };
 
+      const { full, steps, gmRows, totalGm } = loaded;
+      const trajectory = full.trajectory || {};
       const session = analyzeSteps(steps);
-      const title = String(full.title || trajectory.title || full.metadata?.title || trajectory.metadata?.title || session.firstUserTitle || '').trim();
-
-      const totalGm = Number(full.numTotalGeneratorMetadata ?? trajectory.generatorMetadata?.length ?? 0);
-      const gmRows = await fetchAllGeneratorMetadata(
-        call,
-        id,
-        totalGm,
-        Array.isArray(trajectory.generatorMetadata) ? trajectory.generatorMetadata : [],
-        isSuperseded
-      );
-      if (gmRows === null || isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now() };
+      const title = String(full.title || trajectory.title || full.metadata?.title || trajectory.metadata?.title || session.firstUserTitle || inc?.title || '').trim();
       _turnStateGmCountCache.set(`${origin}|${id.toLowerCase()}`, gmRows.length);
 
-      const fallbackDate = full.lastModifiedTime || full.createdTime || trajectory.metadata?.createdAt || new Date().toISOString();
+      const fallbackDate = full.lastModifiedTime || full.createdTime || trajectory.metadata?.createdAt || inc?.fallbackDate || new Date().toISOString();
       const resolved = resolveLatestAndCalls(gmRows, id, session, { steps, fallbackDate });
       let latest = resolved.latest;
       const systemSourceModel = resolved.referenceChatModel || resolved.latestModel;
@@ -557,14 +839,21 @@ async function collect(origin, id, options = {}) {
         nowMs: scannedAt
       });
 
+      const stepExternalCalls = extractExternalApiCallsFromSteps(steps, { fallbackDate });
+      const jsonlById = stepExternalCalls.length
+        ? new Map(readExternalUsageLog(options).map(r => [r.callId, r]))
+        : null;
+      const sessionExternalCalls = stepExternalCalls.map(sc => jsonlById?.get(sc.callId) || sc);
+      const allSessionCalls = sessionExternalCalls.length ? [...resolved.calls, ...sessionExternalCalls] : resolved.calls;
+
       const sessionSpeed = summarizeSessionSpeed(resolved.calls);
       const sessionCache = summarizeCacheReadStats(resolved.calls);
-      const sessionTotals = summarizeSessionTotals(resolved.calls);
-      const sessionModels = summarizeModelUsage(resolved.calls);
+      const sessionTotals = summarizeSessionTotals(allSessionCalls);
+      const sessionModels = summarizeModelUsage(allSessionCalls);
 
       if (!shouldSkipAutoLedgerWrite(options)) {
         try {
-          recordCallsToLedger(resolved.calls, { stateDir: options.stateDir, fallbackDate });
+          recordCallsToLedger(allSessionCalls, { stateDir: options.stateDir, fallbackDate });
         } catch {}
       }
 
@@ -573,6 +862,7 @@ async function collect(origin, id, options = {}) {
         conversation: id,
         title,
         cascadeStatus: full.status || null,
+        lastModifiedTime: full.lastModifiedTime || null,
         latest,
         sessionSpeed,
         sessionCache,
@@ -602,6 +892,15 @@ async function collect(origin, id, options = {}) {
       const curDone = conversations.get(key);
       if (!curDone || !curDone.taskSeq || curDone.taskSeq <= taskSeq) {
         setBoundedMap(conversations, key, { result, at: Date.now(), taskSeq }, CONVERSATIONS_CACHE_MAX_ENTRIES);
+        setBoundedMap(_incrementalCollectCache, key, {
+          rawSteps: steps,
+          rawGmRows: gmRows,
+          lastModifiedTime: full.lastModifiedTime || null,
+          cascadeStatus: full.status || null,
+          title,
+          fallbackDate,
+          result
+        }, INCREMENTAL_COLLECT_MAX_ENTRIES);
       }
       return result;
     } catch (err) {
@@ -629,6 +928,7 @@ async function collectTurnState(origin, id, options = {}) {
   }
   origin = safeOrigin;
   const call = createOriginCaller(origin, null, options, () => false);
+  const gmCacheKey = `${origin}|${id.toLowerCase()}`;
 
   let summaryEntry = null;
   try {
@@ -636,11 +936,30 @@ async function collectTurnState(origin, id, options = {}) {
     summaryEntry = allSummaries?.trajectorySummaries?.[id] || allSummaries?.trajectorySummaries?.[id.toLowerCase()] || null;
   } catch {}
 
+  if (summaryEntry && Number.isFinite(Number(summaryEntry.stepCount))) {
+    const summaryStatus = summaryEntry.status || null;
+    const summarySteps = Math.max(0, Number(summaryEntry.stepCount));
+    const summaryUpdatedAt = String(summaryEntry.lastModifiedTime || '');
+    const isSummaryRunning = summaryStatus === 'CASCADE_RUN_STATUS_RUNNING';
+    const cachedTs = _turnStateCache.get(gmCacheKey);
+    if (
+      cachedTs &&
+      !isSummaryRunning &&
+      options.force !== true &&
+      cachedTs.cascadeStatus === summaryStatus &&
+      cachedTs.stepCount === summarySteps &&
+      cachedTs.lastModifiedTime === summaryUpdatedAt
+    ) {
+      return { ...cachedTs.result, scannedAt: Date.now(), cached: true };
+    }
+  }
+
   let cascadeStatus = null;
   let totalSteps = 0;
   let stepOffset = 0;
   let tailSteps = [];
   let tailGm = [];
+  let lastModifiedTime = summaryEntry?.lastModifiedTime || null;
   const stepWindow = 80;
 
   if (summaryEntry && Number.isFinite(Number(summaryEntry.stepCount))) {
@@ -653,7 +972,6 @@ async function collectTurnState(origin, id, options = {}) {
     if (hintUserStep !== null && hintUserStep < stepOffset && (totalSteps - hintUserStep) <= 480) {
       stepOffset = hintUserStep;
     }
-    const gmCacheKey = `${origin}|${id.toLowerCase()}`;
     const prevGmCount = _turnStateGmCountCache.get(gmCacheKey);
     const gmReqOffset = (Number.isInteger(prevGmCount) && prevGmCount > 30) ? Math.max(0, prevGmCount - 30) : 0;
     const [stepsPage, gmPage] = await Promise.all([
@@ -686,6 +1004,7 @@ async function collectTurnState(origin, id, options = {}) {
   } else {
     const head = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 0 });
     cascadeStatus = head.status || null;
+    if (!lastModifiedTime && head.lastModifiedTime) lastModifiedTime = head.lastModifiedTime;
     totalSteps = Number(head.numTotalSteps ?? head.trajectory?.steps?.length ?? 0);
     const totalGm = Number(head.numTotalGeneratorMetadata ?? head.trajectory?.generatorMetadata?.length ?? 0);
     stepOffset = Math.max(0, totalSteps - stepWindow);
@@ -707,21 +1026,52 @@ async function collectTurnState(origin, id, options = {}) {
   });
 
   const resolved = resolveLatestAndCalls(tailGm, id, null);
-  return {
+  const result = {
     version: PROJECT_VERSION,
     conversation: id,
     cascadeStatus,
+    stepCount: totalSteps,
+    lastModifiedTime: lastModifiedTime || null,
     latest: resolved.latest,
     sessionSpeed: summarizeSessionSpeed(resolved.calls),
     sessionCache: summarizeCacheReadStats(resolved.calls),
     turnTiming,
     scannedAt: nowMs
   };
+  setBoundedMap(_turnStateCache, gmCacheKey, {
+    stepCount: totalSteps,
+    lastModifiedTime: String(lastModifiedTime || ''),
+    cascadeStatus,
+    result
+  }, TURN_STATE_CACHE_MAX_ENTRIES);
+  return result;
+}
+
+async function collectQuotaSummary(origin, options = {}) {
+  const safeOrigin = normalizeLoopbackOrigin(origin);
+  if (!safeOrigin) {
+    throw new Error('无效本机服务地址');
+  }
+  const cached = _quotaCache.get(safeOrigin);
+  if (options.force !== true && cached && (Date.now() - cached.at) < QUOTA_TTL_MS) {
+    return cached.data;
+  }
+  const call = createOriginCaller(safeOrigin, null, options, () => false);
+  const raw = await call('RetrieveUserQuotaSummary', {});
+  const parsed = parseQuotaSummary(raw, Date.now());
+  const result = {
+    ok: true,
+    version: PROJECT_VERSION,
+    ...parsed
+  };
+  setBoundedMap(_quotaCache, safeOrigin, { data: result, at: Date.now() }, 16);
+  return result;
 }
 
 const DEFAULT_SETTINGS = {
   showSpeedInPill: true,
   showCacheInPill: true,
+  showQuotaInPill: true,
   compactPill: false,
   customBudget: null
 };
@@ -736,6 +1086,7 @@ function normalizeSettings(raw = {}) {
   return {
     showSpeedInPill: raw.showSpeedInPill !== false,
     showCacheInPill: raw.showCacheInPill !== false,
+    showQuotaInPill: raw.showQuotaInPill !== false,
     compactPill: raw.compactPill === true,
     customBudget: Number.isFinite(budget) && budget >= 1000 ? Math.round(budget) : null
   };
@@ -763,6 +1114,16 @@ function clearCachesForTest() {
   csrfTokenByOrigin.clear();
   latestCollectSeqByOrigin.clear();
   _turnStateGmCountCache.clear();
+  _turnStateCache.clear();
+  _incrementalCollectCache.clear();
+  _extLogCache.clear();
+  _ledgerCache.clear();
+  _quotaCache.clear();
+  for (const timer of _ledgerWriteTimers.values()) {
+    try { clearTimeout(timer); } catch {}
+  }
+  _ledgerWriteTimers.clear();
+  _ledgerDirtyData.clear();
   _lastDailySyncAt.clear();
 }
 
@@ -771,7 +1132,12 @@ module.exports = {
   collect,
   collectTurnState,
   collectDailyUsage,
+  collectQuotaSummary,
   recordCallsToLedger,
+  getExternalUsageLogPath,
+  readExternalUsageLog,
+  appendExternalUsageRecord,
+  flushPendingLedgersSync,
   getSettings,
   saveSettings,
   resolveCollectCsrfToken,

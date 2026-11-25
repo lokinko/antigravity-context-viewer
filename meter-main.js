@@ -15,7 +15,7 @@ try {
 
 const { normalizeLoopbackOrigin } = require('./local-api');
 const { getProjectVersion } = require('./meter-storage');
-const { collect, collectTurnState, collectDailyUsage, getSettings, saveSettings } = require('./meter-collector');
+const { collect, collectTurnState, collectDailyUsage, collectQuotaSummary, getSettings, saveSettings } = require('./meter-collector');
 
 const PROJECT_VERSION = getProjectVersion('1.0.0');
 const MAIN_STARTED_AT = Date.now();
@@ -23,6 +23,7 @@ const MAIN_CAPABILITIES = {
   scan: true,
   turnState: true,
   dailyUsage: true,
+  quota: true,
   settings: true
 };
 
@@ -120,6 +121,13 @@ function registerMeterIpcHandlers(targetIpcMain = ipcMain) {
     return collectDailyUsage(origin, { force: force === true });
   });
 
+  remove('context-meter:quota');
+  targetIpcMain.handle('context-meter:quota', async (event, force = false) => {
+    const origin = isLocalMainFrameSender(event);
+    if (!origin) throw new Error('仅允许本机主聊天窗口');
+    return collectQuotaSummary(origin, { force: force === true });
+  });
+
   remove('context-meter:get-settings');
   targetIpcMain.handle('context-meter:get-settings', (event) => {
     const origin = isLocalMainFrameSender(event);
@@ -186,7 +194,13 @@ function installContextMeter(win) {
         win.autoHideMenuBar = true;
       } catch {}
     }
-    const onActive = () => { void ensureMeterInjected(win, { force: false }); };
+    let lastActiveProbeAt = 0;
+    const onActive = () => {
+      const now = Date.now();
+      if (now - lastActiveProbeAt < 2000) return;
+      lastActiveProbeAt = now;
+      void ensureMeterInjected(win, { force: false });
+    };
     win.on?.('show', onActive);
     win.on?.('restore', onActive);
     win.on?.('focus', onActive);

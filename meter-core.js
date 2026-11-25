@@ -1103,6 +1103,169 @@
     return bucket;
   }
 
+  function hashStringShort(str) {
+    let h = 0x811c9dc5;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function normalizeExternalUsageRecord(raw, options = {}) {
+    if (!raw || typeof raw !== 'object') return null;
+    const model = String(raw.model || '').trim();
+    if (!model) return null;
+
+    const source = String(raw.source || 'external-api').trim() || 'external-api';
+    const sourceType = String(options.sourceType || raw.sourceType || 'jsonl').trim() || 'jsonl';
+    const rawInVal = raw.inputTokens ?? raw.input_tokens ?? raw.input ?? 0;
+    const rawOutVal = raw.outputTokens ?? raw.output_tokens ?? raw.output ?? 0;
+    const rawCacheReadVal = raw.cacheReadTokens ?? raw.cacheTokens ?? raw.cache_read_tokens ?? raw.cached ?? 0;
+    const rawCacheWriteVal = raw.cacheWriteTokens ?? raw.cacheWrite ?? raw.cacheCreationInputTokens ?? 0;
+    const thinkingTokens = Math.max(0, Number(raw.thinkingTokens ?? raw.reasoningTokens ?? raw.reasoning ?? 0) || 0);
+
+    const cacheStats = computeCacheReadStats({
+      inputTokens: Math.max(0, Number(rawInVal) || 0),
+      cacheReadTokens: Math.max(0, Number(rawCacheReadVal) || 0),
+      cacheWriteTokens: Math.max(0, Number(rawCacheWriteVal) || 0),
+      outputTokens: Math.max(0, Number(rawOutVal) || 0),
+      totalTokens: raw.totalTokens,
+      inputIncludesCache: raw.inputIncludesCache === true,
+      hasInputCacheFields: true
+    });
+
+    const uncachedInput = cacheStats.uncachedInput ?? 0;
+    const cacheRead = cacheStats.cacheRead ?? 0;
+    const cacheWrite = cacheStats.cacheWrite ?? 0;
+    const totalInput = cacheStats.totalInput ?? (uncachedInput + cacheRead);
+    const outputTokens = cacheStats.output ?? 0;
+    const totalTokens = totalInput + outputTokens;
+    if (totalTokens <= 0) return null;
+
+    const rawTs = raw.timestamp ?? raw.createdAt ?? raw.created_at ?? raw.date ?? options.fallbackDate ?? null;
+    const timestampMs = parseTimestampMs(rawTs);
+    const dateKey = (typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date.trim()))
+      ? raw.date.trim()
+      : formatLocalDateKey(timestampMs ?? rawTs);
+
+    let rawId = String(raw.callId || raw.id || raw.responseId || '').trim();
+    if (!rawId) {
+      rawId = `gen-${hashStringShort(`${source}|${timestampMs || rawTs || ''}|${model}|${totalInput}|${outputTokens}`)}`;
+    }
+    const callId = rawId.startsWith('ext:') ? rawId : `ext:${rawId}`;
+
+    const durRaw = num(raw.durationSec ?? raw.elapsedSec ?? raw.elapsed_s);
+    const durationSec = durRaw !== null && durRaw > 0 ? Number(durRaw.toFixed(3)) : null;
+    const tps = (outputTokens > 0 && durationSec && durationSec > 0)
+      ? Number((outputTokens / durationSec).toFixed(1))
+      : null;
+
+    return {
+      callId,
+      stepIndex: Number.isInteger(raw.stepIndex) ? raw.stepIndex : null,
+      source,
+      sourceType,
+      isExternal: true,
+      model,
+      effort: raw.effort ? String(raw.effort).trim() : null,
+      dateKey,
+      timestampMs,
+      status: 'final',
+      isEstimated: false,
+      hasInputCacheFields: true,
+      inputTokens: uncachedInput,
+      cacheWriteTokens: cacheWrite,
+      cacheReadTokens: cacheRead,
+      totalInput,
+      uncachedInput,
+      cacheReadPct: cacheStats.cacheReadPct,
+      outputTokens,
+      thinkingTokens,
+      responseTokens: Math.max(0, outputTokens - thinkingTokens),
+      totalTokens,
+      ttftSec: null,
+      streamingSec: durationSec,
+      durationSec,
+      tps,
+      streamingTps: tps
+    };
+  }
+
+  const EXT_STEP_SKIP_KEYS = new Set([
+    'diff', 'unifiedDiff', 'codeAction', 'metadata', 'thinkingSignature',
+    'inlineData', 'media', 'modelUsage', 'tokenUsage'
+  ]);
+
+  function extractStringsFromStep(value, out) {
+    if (typeof value === 'string') {
+      if (value.includes('response_id:') && value.includes('usage:')) out.push(value);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) extractStringsFromStep(value[i], out);
+      return;
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (EXT_STEP_SKIP_KEYS.has(k)) continue;
+      extractStringsFromStep(value[k], out);
+    }
+  }
+
+  function extractExternalApiCallsFromSteps(steps, options = {}) {
+    const list = Array.isArray(steps) ? steps : [];
+    const found = new Map();
+    const re = /(?:^|\r?\n)---\r?\nresponse_id:\s*([A-Za-z0-9._:-]{6,})\r?\nmodel:\s*([A-Za-z0-9._:/-]+)(?:\r?\neffort:\s*([A-Za-z0-9._-]+))?(?:\r?\nelapsed_s:\s*([0-9.]+))?\r?\nusage:\s*in=(\d+)\s+out=(\d+)(?:\s+reasoning=(\d+|\?))?(?:\s+cached=(\d+))?/g;
+
+    for (let idx = 0; idx < list.length; idx++) {
+      const s = list[idx];
+      if (!s || typeof s !== 'object') continue;
+      const texts = [];
+      extractStringsFromStep(s, texts);
+      if (!texts.length) continue;
+
+      const stepTs = s.metadata?.completedAt ||
+        s.metadata?.createdAt ||
+        s.metadata?.internalMetadata?.statusTransitions?.[0]?.timestamp ||
+        options.fallbackDate ||
+        null;
+
+      for (let t = 0; t < texts.length; t++) {
+        const text = texts[t];
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+          const respId = m[1];
+          const callId = respId.startsWith('ext:') ? respId : `ext:${respId}`;
+          if (found.has(callId)) continue;
+          const hasCached = m[8] !== undefined && m[8] !== '';
+          const rec = normalizeExternalUsageRecord({
+            callId,
+            source: 'codex-api',
+            sourceType: 'step',
+            model: m[2],
+            effort: m[3] || null,
+            durationSec: m[4] ? Number(m[4]) : null,
+            inputTokens: Number(m[5]),
+            outputTokens: Number(m[6]),
+            reasoningTokens: m[7] && m[7] !== '?' ? Number(m[7]) : 0,
+            cacheReadTokens: hasCached ? Number(m[8]) : 0,
+            inputIncludesCache: hasCached,
+            timestamp: stepTs,
+            stepIndex: idx
+          }, { fallbackDate: options.fallbackDate, sourceType: 'step' });
+          if (rec) found.set(callId, rec);
+        }
+      }
+    }
+
+    return Array.from(found.values());
+  }
+
   function summarizeModelUsage(entries = []) {
     const list = Array.isArray(entries) ? entries : Object.values(entries || {});
     const map = new Map();
@@ -1121,8 +1284,12 @@
       const modelName = String(item.model || '').trim() || '未知模型';
       let b = map.get(modelName);
       if (!b) {
-        b = { model: modelName, ...emptyBucketTotals() };
+        b = { model: modelName, isExternal: false, source: null, ...emptyBucketTotals() };
         map.set(modelName, b);
+      }
+      if (item.isExternal === true || (item.source && item.source !== 'antigravity')) {
+        b.isExternal = true;
+        if (!b.source && item.source) b.source = String(item.source);
       }
       b.uncachedInput += rawIn + cw;
       b.cacheWrite += cw;
@@ -1260,6 +1427,90 @@
     return `${mins}m ${rem}s`;
   }
 
+  function formatCountdownSec(sec) {
+    const v = Number(sec);
+    if (sec === null || sec === undefined || !Number.isFinite(v) || v < 0) return '—';
+    if (v < 60) return '<1m';
+    if (v < 3600) return `${Math.floor(v / 60)}m`;
+    if (v < 86400) {
+      const h = Math.floor(v / 3600);
+      const m = Math.floor((v % 3600) / 60);
+      return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    }
+    const d = Math.floor(v / 86400);
+    const h = Math.floor((v % 86400) / 3600);
+    return h > 0 ? `${d}d ${h}h` : `${d}d`;
+  }
+
+  function parseQuotaSummary(raw = {}, nowMs = Date.now()) {
+    const resp = (raw && typeof raw === 'object' && raw.response && typeof raw.response === 'object') ? raw.response : raw;
+    const rawGroups = Array.isArray(resp?.groups) ? resp.groups : [];
+    const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+
+    const groups = rawGroups.map(g => {
+      const displayName = String(g?.displayName || '').trim();
+      const rawBuckets = Array.isArray(g?.buckets) ? g.buckets : [];
+      const buckets = rawBuckets.map(b => {
+        const rawFrac = b?.remainingFraction !== undefined && b?.remainingFraction !== null ? Number(b.remainingFraction) : null;
+        const remainingFraction = (rawFrac !== null && Number.isFinite(rawFrac))
+          ? Math.max(0, Math.min(1, rawFrac))
+          : null;
+        const remainingPct = remainingFraction !== null ? Number((remainingFraction * 100).toFixed(1)) : null;
+        const resetTime = b?.resetTime ? String(b.resetTime).trim() : null;
+        const resetMs = resetTime ? parseTimestampMs(resetTime) : null;
+        const resetInSec = resetMs !== null ? Math.max(0, Math.floor((resetMs - now) / 1000)) : null;
+        return {
+          bucketId: String(b?.bucketId || '').trim(),
+          displayName: String(b?.displayName || '').trim(),
+          window: String(b?.window || '').trim().toLowerCase(),
+          remainingFraction,
+          remainingPct,
+          resetTime,
+          resetInSec,
+          description: String(b?.description || '').trim()
+        };
+      });
+
+      const isThirdParty = /claude|gpt|3p/i.test(displayName) || buckets.some(b => /^3p-/i.test(b.bucketId));
+      const isGemini = !isThirdParty && (/gemini/i.test(displayName) || buckets.some(b => /^gemini-/i.test(b.bucketId)));
+      const key = isThirdParty
+        ? 'third_party'
+        : (isGemini ? 'gemini' : (displayName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'other'));
+      const shortName = isThirdParty ? 'Claude / GPT' : (isGemini ? 'Gemini' : (displayName || '模型配额'));
+      const fiveHour = buckets.find(b => b.window === '5h' || /5h|five.?hour/i.test(`${b.bucketId} ${b.displayName}`)) || null;
+      const weekly = buckets.find(b => b.window === 'weekly' || /week/i.test(`${b.bucketId} ${b.displayName}`)) || null;
+
+      return {
+        key,
+        displayName,
+        shortName,
+        description: String(g?.description || '').trim(),
+        buckets,
+        fiveHour,
+        weekly
+      };
+    });
+
+    return {
+      groups,
+      description: String(resp?.description || '').trim(),
+      fetchedAt: now
+    };
+  }
+
+  function pickQuotaGroupForModel(quotaSummary, modelHint = '') {
+    const groups = Array.isArray(quotaSummary?.groups) ? quotaSummary.groups : [];
+    if (!groups.length) return null;
+    const hint = String(modelHint || '').trim().toLowerCase();
+    if (/claude|opus|sonnet|haiku|gpt|openai/i.test(hint)) {
+      return groups.find(g => g.key === 'third_party' || /claude|gpt/i.test(`${g.displayName} ${g.description}`)) || groups[0];
+    }
+    if (/gemini|orchestrator|flash|neon|carbon|argon|hydrogen/i.test(hint)) {
+      return groups.find(g => g.key === 'gemini' || /gemini/i.test(`${g.displayName} ${g.description}`)) || groups[0];
+    }
+    return groups[0];
+  }
+
   const exportsObj = {
     parseDurationSec,
     parseTimestampMs,
@@ -1278,6 +1529,8 @@
     isCheckpointNewerThanGenerator,
     buildPostCompactSummary,
     parseGeneratorCall,
+    normalizeExternalUsageRecord,
+    extractExternalApiCallsFromSteps,
     isValidSpeedSample,
     summarizeSessionSpeed,
     summarizeTurnTiming,
@@ -1287,7 +1540,10 @@
     summarizeModelUsage,
     summarizeDailyUsage,
     formatTokens,
-    formatDurationSec
+    formatDurationSec,
+    formatCountdownSec,
+    parseQuotaSummary,
+    pickQuotaGroupForModel
   };
 
   if (typeof module !== 'undefined' && module.exports) {

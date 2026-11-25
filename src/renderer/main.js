@@ -35,10 +35,12 @@
     scan: null,
     turnState: null,
     dailyUsage: null,
+    quota: null,
     selectedDay: null,
     settings: {
       showSpeedInPill: true,
       showCacheInPill: true,
+      showQuotaInPill: true,
       compactPill: false,
       customBudget: null
     },
@@ -61,6 +63,17 @@
       }
     } catch {}
     host.setAttribute('data-theme', 'dark');
+  }
+
+  function syncHostFont(anchorEl = null) {
+    if (typeof host.style?.setProperty !== 'function') return;
+    try {
+      const target = anchorEl || document.body;
+      const ff = target ? window.getComputedStyle(target)?.fontFamily : '';
+      if (ff && typeof ff === 'string' && ff.trim()) {
+        host.style.setProperty('--ag-host-font', ff.trim());
+      }
+    } catch {}
   }
 
   function extractRouteUuid() {
@@ -86,6 +99,11 @@
       if (action === 'scan') return window.contextMeterAPI.scan(payload.id, payload.force === true);
       if (action === 'turn-state') return window.contextMeterAPI.getTurnState(payload.id);
       if (action === 'daily-usage') return window.contextMeterAPI.getDailyUsage(payload.force === true);
+      if (action === 'quota') {
+        return typeof window.contextMeterAPI.getQuota === 'function'
+          ? window.contextMeterAPI.getQuota(payload.force === true)
+          : null;
+      }
       if (action === 'get-settings') return window.contextMeterAPI.getSettings();
       if (action === 'save-settings') return window.contextMeterAPI.saveSettings(payload);
     };
@@ -98,6 +116,7 @@
         'scan': '/scan',
         'turn-state': '/turn-state',
         'daily-usage': '/daily-usage',
+        'quota': '/quota',
         'get-settings': '/get-settings',
         'save-settings': '/save-settings'
       };
@@ -202,10 +221,12 @@
   function mountHost() {
     if (state.disposed) return;
     detectTheme();
+    syncHostFont(document.body);
     const wrap = el('wrap');
 
     const modelTrigger = findComposerModelTrigger();
     if (modelTrigger && modelTrigger.parentElement) {
+      syncHostFont(modelTrigger);
       const slot = findComposerHorizontalSlot(modelTrigger);
       const parent = slot.parent;
       const anchor = slot.anchor;
@@ -361,6 +382,12 @@
       nameTxt.textContent = m.model;
       nameWrap.appendChild(dot);
       nameWrap.appendChild(nameTxt);
+      if (m.isExternal) {
+        const badge = document.createElement('span');
+        badge.className = 'model-ext-badge';
+        badge.textContent = 'API';
+        nameWrap.appendChild(badge);
+      }
 
       const val = document.createElement('span');
       val.className = 'model-val';
@@ -514,44 +541,57 @@
       pill.classList.toggle('crit', pctRaw !== null && pctRaw >= 85 || Boolean(latest?.exceeded));
     }
     if (pillPct) {
-      if (!state.route) pillPct.textContent = '空闲';
-      else if (pctRaw !== null && Number.isFinite(pctRaw)) pillPct.textContent = `${pctRaw.toFixed(pctRaw >= 10 ? 0 : 1)}%`;
-      else if (used !== null) pillPct.textContent = core.formatTokens(used);
-      else pillPct.textContent = state.loading ? '…' : '—';
+      if (!state.route) pillPct.textContent = 'context idle';
+      else if (pctRaw !== null && Number.isFinite(pctRaw)) pillPct.textContent = `context ${pctRaw.toFixed(pctRaw >= 10 ? 0 : 1)}%`;
+      else if (used !== null) pillPct.textContent = `context ${core.formatTokens(used)}`;
+      else pillPct.textContent = state.loading ? 'context …' : 'context —';
     }
 
     const speed = latest?.speed || null;
     const liveTtft = timing?.inFlightTtftSec;
     const pillSpeed = el('pill-speed');
+    const pillSpeedWrap = el('pill-speed-wrap');
     const pillSepSpeed = el('pill-sep-speed');
     let speedChip = '';
     if (state.settings.showSpeedInPill && state.route) {
       if (isRunning && liveTtft !== null && liveTtft !== undefined && (!speed || speed.phase === 'idle')) {
-        speedChip = `TTFT ${core.formatDurationSec(liveTtft)}`;
+        speedChip = `ttft ${core.formatDurationSec(liveTtft)}`;
       } else if (speed?.displayTps) {
-        speedChip = `${speed.displayTps} tok/s`;
+        speedChip = `decode ${speed.displayTps} tok/s`;
       } else if (isRunning) {
-        speedChip = '生成中…';
+        speedChip = 'decoding…';
       }
     }
     if (pillSpeed && pillSepSpeed) {
       pillSpeed.textContent = speedChip;
       pillSpeed.hidden = !speedChip;
+      if (pillSpeedWrap) {
+        pillSpeedWrap.hidden = !speedChip;
+        pillSpeedWrap.classList.toggle('live', isRunning);
+      }
       pillSepSpeed.hidden = !speedChip;
       pillSpeed.classList.toggle('live', isRunning);
     }
 
     const cachePct = latest?.cacheHitRate ?? sessionCache?.cacheReadPct ?? null;
     const pillCache = el('pill-cache');
+    const pillCacheWrap = el('pill-cache-wrap');
     const pillSepCache = el('pill-sep-cache');
     const cacheChip = (state.settings.showCacheInPill && state.route && cachePct !== null && Number.isFinite(cachePct))
-      ? `缓存 ${cachePct.toFixed(0)}%`
+      ? `kv-cache ${Number(cachePct.toFixed(1))}%`
       : '';
     if (pillCache && pillSepCache) {
       pillCache.textContent = cacheChip;
       pillCache.hidden = !cacheChip;
+      if (pillCacheWrap) pillCacheWrap.hidden = !cacheChip;
       pillSepCache.hidden = !cacheChip;
     }
+
+    const modelHint = findComposerModelTrigger()?.textContent || latest?.model || '';
+    const activeQuotaGroup = (state.quota && typeof core.pickQuotaGroupForModel === 'function')
+      ? core.pickQuotaGroupForModel(state.quota, modelHint)
+      : null;
+    renderQuotaPill(activeQuotaGroup);
 
     if (el('panel')?.hidden) return;
     positionPanel();
@@ -565,11 +605,13 @@
     el('conn-meta').textContent = `${state.transport || '—'} · v${METER_DISPLAY_VERSION}`;
     el('opt-speed').checked = state.settings.showSpeedInPill !== false;
     el('opt-cache').checked = state.settings.showCacheInPill !== false;
+    if (el('opt-quota')) el('opt-quota').checked = state.settings.showQuotaInPill !== false;
 
     if (state.activeTab === 'daily') {
       renderDaily();
       return;
     }
+    renderQuotaCard(activeQuotaGroup);
 
     const notice = el('notice');
     if (notice) {
@@ -688,8 +730,181 @@
     }
   }
 
+  function quotaToneClass(pct) {
+    if (pct === null || pct === undefined || !Number.isFinite(Number(pct))) return '';
+    const v = Number(pct);
+    if (v < 10) return 'crit';
+    if (v < 25) return 'warn';
+    return '';
+  }
+
+  function renderQuotaPill(group) {
+    const pillQuota = el('pill-quota');
+    const pillSepQuota = el('pill-sep-quota');
+    const q5hEl = el('pill-q5h');
+    const qSepEl = el('pill-q-sep');
+    const qwEl = el('pill-qw');
+    if (!pillQuota || !pillSepQuota || !q5hEl || !qwEl) return;
+
+    const enabled = state.settings.showQuotaInPill !== false;
+    const f5 = group?.fiveHour?.remainingPct ?? null;
+    const fw = group?.weekly?.remainingPct ?? null;
+    const hasAny = enabled && Boolean(group) && (f5 !== null || fw !== null);
+
+    const q5hWrap = el('pill-q5h-wrap');
+    const qwWrap = el('pill-qw-wrap');
+    pillQuota.hidden = !hasAny;
+    pillSepQuota.hidden = !hasAny;
+    if (!hasAny) {
+      q5hEl.textContent = '';
+      qwEl.textContent = '';
+      if (q5hWrap) { q5hWrap.hidden = true; q5hWrap.className = 'pill-metric'; }
+      if (qwWrap) { qwWrap.hidden = true; qwWrap.className = 'pill-metric'; }
+      if (qSepEl) qSepEl.hidden = true;
+      return;
+    }
+
+    if (f5 !== null) {
+      q5hEl.textContent = `5h ${Math.round(f5)}%`;
+      q5hEl.hidden = false;
+      const t5 = quotaToneClass(f5);
+      q5hEl.className = t5 ? `q-${t5}` : '';
+      if (q5hWrap) {
+        q5hWrap.hidden = false;
+        q5hWrap.className = 'pill-metric' + (t5 ? ` q-${t5}` : '');
+      }
+    } else {
+      q5hEl.textContent = '';
+      q5hEl.hidden = true;
+      q5hEl.className = '';
+      if (q5hWrap) { q5hWrap.hidden = true; q5hWrap.className = 'pill-metric'; }
+    }
+
+    if (fw !== null) {
+      qwEl.textContent = `weekly ${Math.round(fw)}%`;
+      qwEl.hidden = false;
+      const tw = quotaToneClass(fw);
+      qwEl.className = tw ? `q-${tw}` : '';
+      if (qwWrap) {
+        qwWrap.hidden = false;
+        qwWrap.className = 'pill-metric' + (tw ? ` q-${tw}` : '');
+      }
+    } else {
+      qwEl.textContent = '';
+      qwEl.hidden = true;
+      qwEl.className = '';
+      if (qwWrap) { qwWrap.hidden = true; qwWrap.className = 'pill-metric'; }
+    }
+
+    if (qSepEl) qSepEl.hidden = !(f5 !== null && fw !== null);
+
+    const tips = [];
+    if (group.shortName) tips.push(group.shortName);
+    if (f5 !== null) tips.push(`5h 剩余 ${f5.toFixed(1)}% (${core.formatCountdownSec(group.fiveHour.resetInSec)} 后重置)`);
+    if (fw !== null) tips.push(`本周剩余 ${fw.toFixed(1)}% (${core.formatCountdownSec(group.weekly.resetInSec)} 后重置)`);
+    pillQuota.title = tips.join(' · ');
+  }
+
+  function renderQuotaCard(activeGroup) {
+    const card = el('quota-card');
+    const listEl = el('quota-list');
+    const activeLbl = el('quota-active-grp');
+    if (!card || !listEl) return;
+
+    const groups = Array.isArray(state.quota?.groups) ? state.quota.groups : [];
+    card.hidden = groups.length === 0;
+    if (groups.length === 0) return;
+
+    if (activeLbl) {
+      activeLbl.textContent = activeGroup?.shortName ? `当前匹配: ${activeGroup.shortName}` : '';
+    }
+    listEl.innerHTML = '';
+
+    groups.forEach((g) => {
+      const grpEl = document.createElement('div');
+      grpEl.className = 'quota-grp';
+
+      const hdr = document.createElement('div');
+      hdr.className = 'quota-grp-hdr';
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = g.shortName || g.displayName || '配额组';
+      const tagSpan = document.createElement('span');
+      tagSpan.className = 'muted-note';
+      tagSpan.textContent = activeGroup && g.key === activeGroup.key ? '当前使用' : '';
+      hdr.appendChild(nameSpan);
+      hdr.appendChild(tagSpan);
+      grpEl.appendChild(hdr);
+
+      const bars = document.createElement('div');
+      bars.className = 'quota-bars';
+
+      const items = [
+        { label: '5 小时限额', b: g.fiveHour },
+        { label: '每周限额', b: g.weekly }
+      ];
+      items.forEach(({ label, b }) => {
+        const item = document.createElement('div');
+        item.className = 'quota-item';
+
+        const top = document.createElement('div');
+        top.className = 'quota-item-top';
+        const kSpan = document.createElement('span');
+        kSpan.className = 'k';
+        kSpan.textContent = label;
+        const vSpan = document.createElement('span');
+        const tone = quotaToneClass(b?.remainingPct ?? null);
+        vSpan.className = 'v' + (tone ? ` q-${tone}` : '');
+        vSpan.textContent = b?.remainingPct != null ? `${b.remainingPct.toFixed(0)}%` : '—';
+        top.appendChild(kSpan);
+        top.appendChild(vSpan);
+
+        const track = document.createElement('div');
+        track.className = 'quota-bar';
+        const fill = document.createElement('div');
+        fill.className = 'quota-fill' + (tone ? ` ${tone}` : '');
+        fill.style.width = `${b?.remainingPct != null ? Math.max(0, Math.min(100, b.remainingPct)) : 0}%`;
+        track.appendChild(fill);
+
+        const resetEl = document.createElement('div');
+        resetEl.className = 'quota-reset';
+        resetEl.textContent = b?.resetInSec != null ? `${core.formatCountdownSec(b.resetInSec)} 后重置` : '—';
+
+        item.appendChild(top);
+        item.appendChild(track);
+        item.appendChild(resetEl);
+        bars.appendChild(item);
+      });
+
+      grpEl.appendChild(bars);
+      listEl.appendChild(grpEl);
+    });
+  }
+
+  const POLL_ACTIVE_MS = 1200;
+  const POLL_IDLE_MS = 4500;
+  const QUOTA_REFRESH_MS = 60000;
   let scanInFlight = false;
+  let pollInFlight = false;
+  let quotaLoading = false;
   let lastScanAt = 0;
+  let lastQuotaAt = 0;
+  let nextPollAt = 0;
+
+  async function refreshQuota(force = false) {
+    if (state.disposed || quotaLoading) return;
+    if (!force && lastQuotaAt > 0 && (Date.now() - lastQuotaAt) < QUOTA_REFRESH_MS) return;
+    quotaLoading = true;
+    try {
+      const res = await callBackend('quota', { force });
+      if (res && res.ok !== false && Array.isArray(res.groups)) {
+        state.quota = res;
+        lastQuotaAt = Date.now();
+        render();
+      }
+    } catch {} finally {
+      quotaLoading = false;
+    }
+  }
 
   async function refreshDaily(force = false) {
     if (state.disposed || state.dailyLoading) return;
@@ -739,16 +954,25 @@
     }
   }
 
-  async function pollTick() {
-    if (state.disposed || document.hidden) return;
-    mountHost();
+  async function pollTick(forceWake = false) {
+    if (state.disposed || document.hidden || pollInFlight) return;
+    const now = Date.now();
+    if (forceWake !== true && nextPollAt > 0 && now < nextPollAt) return;
+    if (!host.isConnected || state.mountMode !== 'composer') {
+      mountHost();
+    }
+    if (now - lastQuotaAt >= QUOTA_REFRESH_MS) {
+      void refreshQuota(false);
+    }
     const route = extractRouteUuid();
     if (route !== state.route) {
+      nextPollAt = 0;
       await refresh(true);
       return;
     }
     if (!route) return;
 
+    pollInFlight = true;
     const wasRunning = Boolean(state.turnState?.turnTiming?.isRunning || state.scan?.turnTiming?.isRunning);
     try {
       const ts = await callBackend('turn-state', { id: route });
@@ -757,13 +981,28 @@
         state.error = null;
       }
       const nowRunning = Boolean(ts?.turnTiming?.isRunning || ts?.cascadeStatus === 'CASCADE_RUN_STATUS_RUNNING');
-      if ((wasRunning && !nowRunning) || (!state.scan && !scanInFlight) || (Date.now() - lastScanAt > 8000 && !nowRunning)) {
-        await refresh(wasRunning && !nowRunning);
+      const scanSteps = Number.isFinite(Number(state.scan?.session?.steps)) ? Number(state.scan.session.steps) : null;
+      const tsSteps = Number.isFinite(Number(ts?.stepCount)) ? Number(ts.stepCount) : null;
+      const scanMod = state.scan?.lastModifiedTime || null;
+      const tsMod = ts?.lastModifiedTime || null;
+      const hasMetaChange = Boolean(
+        (tsSteps !== null && scanSteps !== null && tsSteps !== scanSteps) ||
+        (tsMod && scanMod && tsMod !== scanMod)
+      );
+      const staleFallback = Boolean(tsSteps === null && !tsMod && Date.now() - lastScanAt > 15000);
+
+      if ((wasRunning && !nowRunning) || (!state.scan && !scanInFlight) || (!nowRunning && (hasMetaChange || staleFallback))) {
+        await refresh((wasRunning && !nowRunning) || hasMetaChange);
+        if (wasRunning && !nowRunning) void refreshQuota(true);
       } else {
         render();
       }
+      nextPollAt = Date.now() + (nowRunning ? POLL_ACTIVE_MS : POLL_IDLE_MS);
     } catch {
       if (!state.scan && !scanInFlight) await refresh(false);
+      nextPollAt = Date.now() + POLL_IDLE_MS;
+    } finally {
+      pollInFlight = false;
     }
   }
 
@@ -772,7 +1011,9 @@
     state.open = !state.open;
     el('panel').hidden = !state.open;
     if (state.open) {
+      nextPollAt = 0;
       render();
+      void refreshQuota(false);
       if (state.activeTab === 'daily') void refreshDaily(false);
       else if (!state.scan) void refresh(false);
     }
@@ -803,6 +1044,8 @@
   });
 
   el('btn-refresh')?.addEventListener('click', () => {
+    nextPollAt = 0;
+    void refreshQuota(true);
     if (state.activeTab === 'daily') void refreshDaily(true);
     else void refresh(true);
   });
@@ -810,7 +1053,8 @@
   const handleSettingChange = async () => {
     const patch = {
       showSpeedInPill: Boolean(el('opt-speed')?.checked),
-      showCacheInPill: Boolean(el('opt-cache')?.checked)
+      showCacheInPill: Boolean(el('opt-cache')?.checked),
+      showQuotaInPill: Boolean(el('opt-quota')?.checked)
     };
     Object.assign(state.settings, patch);
     render();
@@ -818,6 +1062,7 @@
   };
   el('opt-speed')?.addEventListener('change', handleSettingChange);
   el('opt-cache')?.addEventListener('change', handleSettingChange);
+  el('opt-quota')?.addEventListener('change', handleSettingChange);
 
   const onDocClick = (e) => {
     if (!state.open) return;
@@ -829,13 +1074,35 @@
   };
   document.addEventListener('click', onDocClick);
 
-  const onRouteChange = () => { void refresh(false); };
+  const onVisibilityChange = () => {
+    if (!document.hidden && !state.disposed) {
+      nextPollAt = 0;
+      void pollTick(true);
+    }
+  };
+  document.addEventListener('visibilitychange', onVisibilityChange);
+
+  const onRouteChange = () => {
+    nextPollAt = 0;
+    void refresh(false);
+  };
   window.addEventListener('popstate', onRouteChange);
   window.addEventListener('hashchange', onRouteChange);
 
+  const onFocus = () => {
+    nextPollAt = 0;
+  };
+  window.addEventListener('focus', onFocus);
+
+  let resizeTimer = null;
   const onResize = () => {
-    mountHost();
-    positionPanel();
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      if (state.disposed) return;
+      mountHost();
+      positionPanel();
+    }, 100);
   };
   window.addEventListener('resize', onResize);
 
@@ -853,7 +1120,7 @@
   });
   mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
 
-  const timer = setInterval(pollTick, 1200);
+  const timer = setInterval(pollTick, POLL_ACTIVE_MS);
 
   mountHost();
   void callBackend('get-settings').then(res => {
@@ -862,6 +1129,7 @@
       render();
     }
   }).catch(() => {});
+  void refreshQuota(false);
   void refresh(false);
 
   globalThis.__AGContextMeter = {
@@ -870,15 +1138,19 @@
     buildId: BUILD_ID,
     refresh,
     refreshDaily,
+    refreshQuota,
     getState: () => ({ ...state }),
     dispose() {
       state.disposed = true;
       clearInterval(timer);
       if (mountRetryTimer) clearTimeout(mountRetryTimer);
+      if (resizeTimer) clearTimeout(resizeTimer);
       mo.disconnect();
       document.removeEventListener('click', onDocClick);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('popstate', onRouteChange);
       window.removeEventListener('hashchange', onRouteChange);
+      window.removeEventListener('focus', onFocus);
       window.removeEventListener('resize', onResize);
       host.remove();
     }

@@ -8,15 +8,15 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { connect, normalizeLoopbackOrigin } = require('./local-api');
-const { collect, collectTurnState, collectDailyUsage, getSettings, saveSettings } = require('./meter-collector');
+const { collect, collectTurnState, collectDailyUsage, collectQuotaSummary, getSettings, saveSettings } = require('./meter-collector');
 const { getStateDir } = require('./asar-engine');
 const { getProjectVersion } = require('./meter-storage');
 
 const PROJECT_VERSION = getProjectVersion('1.0.0');
 const MAX_BODY_BYTES = 256 * 1024;
-const ALLOWED_ROUTES = ['/runtime-info', '/scan', '/turn-state', '/daily-usage', '/get-settings', '/save-settings', '/shutdown'];
+const ALLOWED_ROUTES = ['/runtime-info', '/scan', '/turn-state', '/daily-usage', '/quota', '/get-settings', '/save-settings', '/shutdown'];
 const LIVE_HOST_STARTED_AT = Date.now();
-const LIVE_CAPABILITIES = { scan: true, turnState: true, dailyUsage: true, settings: true };
+const LIVE_CAPABILITIES = { scan: true, turnState: true, dailyUsage: true, quota: true, settings: true };
 
 function timingSafeTokenEqual(provided, expected) {
   if (typeof provided !== 'string' || typeof expected !== 'string' || !expected) return false;
@@ -115,6 +115,8 @@ function createLiveRequestHandler({ api, secret, getAllowedOrigins = null, onShu
           data = await collectTurnState(targetOrigin, parsed.id);
         } else if (req.url === '/daily-usage') {
           data = await collectDailyUsage(targetOrigin, { force: parsed.force === true });
+        } else if (req.url === '/quota') {
+          data = await collectQuotaSummary(targetOrigin, { force: parsed.force === true });
         } else if (req.url === '/get-settings') {
           data = getSettings();
         } else if (req.url === '/save-settings') {
