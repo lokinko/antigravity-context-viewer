@@ -7,7 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { getStateDir, getAppDataDir, isIsolatedTestPath, builtinAsar, collectUnpackedPaths, loadAsarEngine } = require('./asar-engine');
+const { getStateDir, getAppDataDir, isIsolatedTestPath, builtinAsar, collectUnpackedPaths, loadAsarEngine, getRawFs } = require('./asar-engine');
 const { discoverAntigravityCdp, createCdpClient } = require('./local-api');
 const { inspectMacAsarIntegrity } = require('./macos-binary-utils');
 const { acquireFileLock } = require('./meter-storage');
@@ -21,7 +21,8 @@ const {
 } = require('./modular-installer');
 
 const asar = loadAsarEngine();
-const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const rawFs = getRawFs();
+const sha = file => crypto.createHash('sha256').update(rawFs.readFileSync(file)).digest('hex');
 
 const STALE_ADDITIONS = [
   'asar-engine.js', 'modules-config.js', 'modular-installer.js', 'host-recovery.js',
@@ -87,7 +88,7 @@ async function restore(options = {}) {
   }
   const info = hasManifest ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : { installed: path.resolve(customPath) };
   const targetFile = customPath ? path.resolve(customPath) : (info.installed ? path.resolve(info.installed) : null);
-  if (!targetFile || !fs.existsSync(targetFile)) {
+  if (!targetFile || !rawFs.existsSync(targetFile)) {
     throw new Error(`Target file not found: ${targetFile || info.installed}`);
   }
   if (hasManifest && customPath && info.installed && path.resolve(info.installed) !== path.resolve(targetFile) && !inPlaceExplicit) {
@@ -130,7 +131,7 @@ async function restore(options = {}) {
     let validExpectedSha = null;
     let backupHostVer = null;
     for (const c of backupCandidates) {
-      if (c.path && fs.existsSync(c.path) && c.expected && sha(c.path) === c.expected) {
+      if (c.path && rawFs.existsSync(c.path) && c.expected && sha(c.path) === c.expected) {
         try {
           const ver = JSON.parse(extractAsarFile(c.path, 'package.json').toString('utf8')).version;
           validBackup = c.path;
@@ -158,11 +159,14 @@ async function restore(options = {}) {
 
     if (!inPlaceExplicit && validBackup && versionMatches && currentInstalledSha === info.patchedSha256 && !force) {
       try {
-        fs.copyFileSync(validBackup, targetFile);
+        rawFs.copyFileSync(validBackup, targetFile);
         clearAsarCache(targetFile);
       } catch (err) {
-        if (err.code === 'EBUSY' || err.code === 'EPERM') {
-          throw new Error(`无法还原 ${targetFile}：文件正被运行中的 Antigravity 锁定，请先退出客户端。`);
+        if (err.code === 'EBUSY') {
+          throw new Error(`无法还原 ${targetFile}：文件正被运行中的 Antigravity 锁定，请先完全退出客户端（含托盘图标）。`);
+        }
+        if (err.code === 'EPERM' || err.code === 'EACCES') {
+          throw new Error(`无法还原 ${targetFile}：权限不足或文件被占用，请退出 Antigravity 并尝试以管理员身份运行。`);
         }
         throw err;
       }
@@ -223,12 +227,20 @@ async function restore(options = {}) {
         const unpackedPaths = collectUnpackedPaths(asar, targetFile);
         await builtinAsar.createPackageWithOptions(staging, packed, unpackedPaths.size > 0 ? { unpackedPaths } : {});
         const tempReplacement = path.join(path.dirname(targetFile), `app.asar.restore_tmp_${stamp}`);
-        fs.copyFileSync(packed, tempReplacement);
+        rawFs.copyFileSync(packed, tempReplacement);
         try {
-          fs.copyFileSync(tempReplacement, targetFile);
+          rawFs.copyFileSync(tempReplacement, targetFile);
           clearAsarCache(targetFile);
+        } catch (err) {
+          if (err.code === 'EBUSY') {
+            throw new Error(`无法还原 ${targetFile}：文件正被运行中的 Antigravity 锁定，请先完全退出客户端（含托盘图标）。`);
+          }
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            throw new Error(`无法还原 ${targetFile}：权限不足或文件被占用，请退出 Antigravity 并尝试以管理员身份运行。`);
+          }
+          throw err;
         } finally {
-          try { if (fs.existsSync(tempReplacement)) fs.unlinkSync(tempReplacement); } catch {}
+          try { if (rawFs.existsSync(tempReplacement)) rawFs.unlinkSync(tempReplacement); } catch {}
         }
         const postRestoreUtils = extractAsarFile(targetFile, 'dist/utils.js').toString('utf8');
         if (postRestoreUtils.includes('installContextMeter') || !verifyCleanStructure(postRestoreUtils)) {
@@ -245,13 +257,13 @@ async function restore(options = {}) {
         return { restored: targetFile, inPlaceCleaned: true, hotDisposed };
       } finally {
         try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
-        try { fs.rmSync(packed, { force: true }); } catch {}
+        try { if (rawFs.existsSync(packed)) rawFs.unlinkSync(packed); } catch {}
         try { fs.rmSync(packed + '.unpacked', { recursive: true, force: true }); } catch {}
       }
     }
 
     if (!validBackup) throw new Error('Backup checksum mismatch; refusing restore');
-    fs.copyFileSync(validBackup, targetFile);
+    rawFs.copyFileSync(validBackup, targetFile);
     clearAsarCache(targetFile);
     if (sha(targetFile) !== validExpectedSha) throw new Error('Restored file checksum mismatch');
     const hotDisposed = await tryHotDispose();

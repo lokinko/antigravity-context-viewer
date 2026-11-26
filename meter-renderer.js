@@ -1,7 +1,7 @@
 (function () {
   const METER_VERSION = '1.0.0';
   const METER_DISPLAY_VERSION = '1.0.0';
-  const BUILD_ID = '7fba881d20b9';
+  const BUILD_ID = 'a208f6726e7b';
   const RING_CIRCUMFERENCE = 2 * Math.PI * 7;
   const MODEL_COLORS = ['#3b82f6', '#10b981', '#a855f7', '#f59e0b', '#ec4899', '#06b6d4'];
 
@@ -86,29 +86,29 @@ button, input {
 }
 
 .wrap.in-composer .pill {
-  min-height: 26px;
-  padding: 3px 8px;
-  font-size: 11.5px;
+  min-height: 24px;
+  padding: 4px 7px;
+  font-size: 11px;
+  line-height: 14px;
 }
 
 .pill {
   display: inline-flex;
   align-items: center;
   box-sizing: border-box;
-  gap: 4px;
+  gap: 3px;
   height: auto;
-  min-height: 26px;
-  padding: 3px 8px;
+  min-height: 24px;
+  padding: 4px 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--pill-bg);
   color: var(--muted);
-  font-size: 11.5px;
-  line-height: 1.25;
-  letter-spacing: -0.01em;
+  font-size: 11px;
+  line-height: 14px;
+  letter-spacing: normal;
   font-weight: 400;
   cursor: pointer;
-  font-variant-numeric: tabular-nums;
   transition: background 0.15s ease, border-color 0.15s ease;
   white-space: nowrap;
 }
@@ -121,8 +121,8 @@ button, input {
 .pill.crit { border-color: rgba(239, 68, 68, 0.55); }
 
 .ring {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
   transform: rotate(-90deg);
   flex-shrink: 0;
 }
@@ -145,18 +145,19 @@ button, input {
 .pill.crit .ring-fg { stroke: var(--crit); }
 
 .pill-sep, .pill-q-sep {
-  opacity: 0.25;
+  opacity: 0.22;
   margin: 0 -1px;
+  font-size: 10px;
   line-height: 1;
 }
 .pill-chip { color: inherit; opacity: 1; font-size: inherit; }
 .pill-chip.live, .pill-metric.live .pill-chip { color: inherit; opacity: 1; }
-.pill-metric { display: inline-flex; align-items: center; gap: 3px; }
-.pill-quota { display: inline-flex; align-items: center; gap: 4px; }
+.pill-metric { display: inline-flex; align-items: center; gap: 2px; }
+.pill-quota { display: inline-flex; align-items: center; gap: 3px; }
 .pill-metric[hidden], .pill-quota[hidden], .pill-sep[hidden], .pill-q-sep[hidden] { display: none; }
 .pill-ico {
-  width: 11.5px;
-  height: 11.5px;
+  width: 11px;
+  height: 11px;
   flex-shrink: 0;
   fill: none;
   stroke: currentColor;

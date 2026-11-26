@@ -20,6 +20,7 @@ const {
 const { install } = require('../install');
 const { restore } = require('../restore');
 const { createLiveRequestHandler } = require('../live-host');
+const { assertRuntimeNodeVersion } = require('../cli');
 
 describe('modular-installer, ASAR install/restore & live-host', () => {
   let tmpDir;
@@ -138,5 +139,22 @@ function createWindow(url, storageManager, options) {
     } finally {
       await new Promise(r => srv.close(r));
     }
+  });
+
+  it('validates runtime Node versions and resolves custom install directories cleanly', () => {
+    const { findAsarPath } = require('../asar-engine');
+
+    assert.throws(() => assertRuntimeNodeVersion('install', 'v16.20.2'), /18\.0\.0/);
+    assert.doesNotThrow(() => assertRuntimeNodeVersion('install', 'v18.19.0'));
+    assert.throws(() => assertRuntimeNodeVersion('watch', 'v20.11.0'), /22\.4\.0/);
+    assert.doesNotThrow(() => assertRuntimeNodeVersion('live', 'v22.4.0'));
+
+    const customAppDir = path.join(tmpDir, 'CustomAntigravity');
+    const customResDir = path.join(customAppDir, 'resources');
+    fs.mkdirSync(customResDir, { recursive: true });
+    const mockFile = path.join(customResDir, 'app.asar');
+    fs.writeFileSync(mockFile, 'stub');
+    assert.equal(findAsarPath(customAppDir), mockFile);
+    assert.equal(findAsarPath(mockFile), mockFile);
   });
 });

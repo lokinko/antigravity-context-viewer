@@ -392,7 +392,10 @@ async function acquireFileLockAsync(targetPath, timeoutOrOptions = DEFAULT_FILE_
   while (true) {
     try {
       return tryAcquireFileLockOnce(lockFile);
-    } catch {
+    } catch (lockErr) {
+      if (lockErr && (lockErr.code === 'EACCES' || lockErr.code === 'EPERM' || lockErr.code === 'EROFS')) {
+        throw new Error(`没有目标目录的写入权限 (${path.dirname(lockFile)})，请以管理员身份运行安装脚本。`);
+      }
       if (Date.now() - start >= opts.timeoutMs) {
         throw new Error(`获取文件写锁超时 (${lockFile})`);
       }
@@ -424,7 +427,10 @@ function acquireSyncFileLock(targetPath, timeoutOrOptions = DEFAULT_FILE_LOCK_TI
   while (true) {
     try {
       return tryAcquireFileLockOnce(lockFile);
-    } catch {
+    } catch (lockErr) {
+      if (lockErr && (lockErr.code === 'EACCES' || lockErr.code === 'EPERM' || lockErr.code === 'EROFS')) {
+        throw new Error(`没有目标目录的写入权限 (${path.dirname(lockFile)})，请以管理员身份运行安装脚本。`);
+      }
       if (Date.now() - start >= opts.timeoutMs) {
         throw new Error(`获取文件写锁超时 (${lockFile})`);
       }

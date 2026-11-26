@@ -9,7 +9,7 @@ const os = require('os');
 const path = require('path');
 const net = require('net');
 const { spawn, execFile } = require('child_process');
-const { findAsarPath, getStateDir } = require('./asar-engine');
+const { findAsarPath, getStateDir, getRawFs } = require('./asar-engine');
 const { discoverAntigravityCdp, createCdpClient, parseExplicitPort } = require('./local-api');
 const { inspectMacAsarIntegrity } = require('./macos-binary-utils');
 const { getProjectVersion } = require('./meter-storage');
@@ -318,7 +318,8 @@ async function cmdStatus(customPath, cdpOptions = {}) {
 
   let asarPatched = false;
   let hostVersion = null;
-  if (asarPath && fs.existsSync(asarPath)) {
+  const rawFs = getRawFs();
+  if (asarPath && rawFs.existsSync(asarPath)) {
     try {
       hostVersion = JSON.parse(extractAsarFile(asarPath, 'package.json').toString('utf8')).version || null;
       const utils = extractAsarFile(asarPath, 'dist/utils.js').toString('utf8');
@@ -533,8 +534,25 @@ function parseCliArgs(args = []) {
   return { command, flags };
 }
 
+function assertRuntimeNodeVersion(command, versionStr = process.versions?.node || process.version) {
+  const cleaned = String(versionStr || '').replace(/^v/i, '');
+  const parts = cleaned.split('.').map(n => Number(n) || 0);
+  const major = parts[0] || 0;
+  const minor = parts[1] || 0;
+  if (command === 'live' || command === 'watch') {
+    if (major < 22 || (major === 22 && minor < 4)) {
+      throw new Error(`当前 Node.js 版本 (v${cleaned}) 过低：live / watch 模式需要 Node.js >= 22.4.0。请升级 Node.js 或使用 \`node cli.js install\`。`);
+    }
+  } else if (command === 'install' || command === 'restore' || command === 'check' || command === 'status') {
+    if (major < 18) {
+      throw new Error(`当前 Node.js 版本 (v${cleaned}) 过低：安装或检查至少需要 Node.js >= 18.0.0。请升级 Node.js 或改用 install.bat 自动复用 Antigravity 内置运行时。`);
+    }
+  }
+}
+
 async function main() {
   const { command, flags } = parseCliArgs(process.argv.slice(2));
+  assertRuntimeNodeVersion(command);
   if (command === 'check') {
     await cmdCheck(flags.path, { port: flags.port });
   } else if (command === 'install') {
@@ -576,6 +594,7 @@ if (require.main === module) {
 
 module.exports = {
   parseCliArgs,
+  assertRuntimeNodeVersion,
   cmdCheck,
   cmdStatus,
   queryLiveWindow,

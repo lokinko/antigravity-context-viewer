@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 function getRawFs() {
   if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
@@ -173,7 +174,7 @@ const builtinAsar = {
           if (isUnpacked) {
             const unpackedTarget = path.join(destAsar + '.unpacked', childPosix);
             fs.mkdirSync(path.dirname(unpackedTarget), { recursive: true });
-            fs.copyFileSync(fullPath, unpackedTarget);
+            rawFs.copyFileSync(fullPath, unpackedTarget);
             files[entry.name] = { size: buf.length, unpacked: true, integrity };
           } else {
             files[entry.name] = { size: buf.length, offset: String(offset), integrity };
@@ -292,6 +293,35 @@ function isIsolatedTestPath(targetPath) {
   );
 }
 
+function findWindowsAsarViaRegistry(rawFs) {
+  const hives = [
+    'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+  ];
+  for (const hive of hives) {
+    try {
+      const out = execFileSync('reg', ['query', hive, '/s', '/f', 'Antigravity'], {
+        encoding: 'utf8',
+        timeout: 2500,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+      const lines = String(out || '').split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/^\s*(?:InstallLocation|DisplayIcon)\s+REG_\w+\s+(.+)$/i);
+        if (!m) continue;
+        let val = m[1].trim().replace(/^"(.*)"$/, '$1').replace(/,\d+$/, '');
+        if (!val) continue;
+        const dir = /\.(exe|ico)$/i.test(val) ? path.dirname(val) : val;
+        const cand = path.join(dir, 'resources', 'app.asar');
+        if (rawFs.existsSync(cand)) return cand;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 /**
  * 探测本机 Antigravity 宿主 app.asar 安装路径（纯路径定位，无安装副作用）
  */
@@ -329,7 +359,10 @@ function findAsarPath(customPath) {
     const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
     candidates.push(
       path.join(localAppData, 'Programs', 'antigravity', 'resources', 'app.asar'),
+      path.join(localAppData, 'Programs', 'Antigravity IDE', 'resources', 'app.asar'),
+      path.join(localAppData, 'Programs', 'Google Antigravity', 'resources', 'app.asar'),
       path.join(programFiles, 'antigravity', 'resources', 'app.asar'),
+      path.join(programFiles, 'Antigravity IDE', 'resources', 'app.asar'),
       path.join(programFiles, 'Google Antigravity', 'resources', 'app.asar'),
       path.join(home, 'AppData', 'Roaming', 'antigravity', 'resources', 'app.asar')
     );
@@ -352,6 +385,10 @@ function findAsarPath(customPath) {
   }
   for (const p of candidates) {
     if (rawFs.existsSync(p)) return p;
+  }
+  if (process.platform === 'win32') {
+    const fromReg = findWindowsAsarViaRegistry(rawFs);
+    if (fromReg) return fromReg;
   }
   throw new Error('Could not auto-detect Antigravity installation (app.asar). Use --path <path-to-app.asar>.');
 }
