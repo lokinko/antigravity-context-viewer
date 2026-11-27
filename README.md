@@ -14,6 +14,7 @@
   - **生成性能与延迟**：输出速率、整体速度、首字延迟（TTFT）、生成耗时与会话平均速度
   - **配额重置倒计时**：同时查看 Gemini 与 Claude / GPT 两组 5 小时 / 每周额度剩余与重置时间
   - **会话与每日用量看板**：当前对话累计消耗、近 14 天每日趋势图、按模型消耗分布，以及外接 `codex-api` 等外部模型 API 的 `API` 用量汇总
+- **全环境统一监控（含 SSH Remote）**：兼容本机与 **SSH Remote** 远端工作区窗口（自动复用 Antigravity 的 SSH SOCKS5 会话隧道），远端对话用量自动按唯一会话 UUID 去重合并至本机统一的每日用量账本。
 - **双模式注入**：
   - **ASAR 持久化注入（`install` / `restore`）**：原生 `app.asar` 补丁，附带 SHA-256 备份校验与无损还原；安装时会自动清洗旧版注入残留并支持 Antigravity 2.34+ `loadHubWindowUrl`
   - **CDP 免改盘热注入（`live` / `watch`）**：通过 DevTools 端口实时注入并附带 `live-host` 本地桥接服务，适合免改盘试用、macOS 签名校验环境或渲染层调试
@@ -109,8 +110,8 @@ Antigravity 客户端自动更新会覆盖替换宿主原有的 `resources/app.a
   通常是因为在压缩包管理器中直接双击运行，请先将整个压缩包解压到本地磁盘目录后再运行。
 - **提示找不到 `app.asar`（`Could not auto-detect Antigravity installation`）**
   请通过 `--path "<app.asar 完整路径>"` 参数或环境变量 `AG_ASAR_PATH` 手动指定宿主 `resources/app.asar` 位置。
-- **SSH Remote 远端窗口暂不支持，面板报错 `ECONNREFUSED`**
-  当前版本暂未支持 **SSH Remote** 远端工作区窗口。由于远端 Language Server 运行在远程主机本地并通过 Antigravity 的 SSH SOCKS5 隧道通信，本机直连探测会出现 `ECONNREFUSED`；请在本地工作区窗口中使用本插件。
+- **SSH Remote 远端窗口连接报错**
+  已原生支持 **SSH Remote** 远端工作区窗口：插件会自动识别远端窗口并复用 Antigravity 的 SSH SOCKS5 隧道与会话鉴权，同时将远端用量合并统计到本地每日用量账本。若网络波动导致短暂报错（如 `ERR_PROXY_CONNECTION_FAILED`），待 Antigravity 的 SSH 自动重连完成后点击刷新图标即可恢复。
 
 ---
 

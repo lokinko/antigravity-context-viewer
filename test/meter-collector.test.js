@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 
 const { collect, collectTurnState, collectDailyUsage, collectQuotaSummary, getSettings, saveSettings, appendExternalUsageRecord, readExternalUsageLog, clearCachesForTest } = require('../meter-collector');
+const { registerMeterIpcHandlers, buildCollectorOptions } = require('../meter-main');
 
 describe('meter-collector', () => {
   let server;
@@ -531,5 +532,235 @@ describe('meter-collector', () => {
     } finally {
       await new Promise(r => quotaServer.close(r));
     }
+  });
+
+  it('routes SSH remote sessions via sessionFetch, isolates per-host caches, and merges into unified daily ledger', async () => {
+    const remoteCascadeId = '99999999-8888-7777-6666-555555555555';
+    let remoteToken = 'remote-tok-1';
+    let sessionFetchCalls = 0;
+
+    const makeJsonRes = (data, status = 200) => {
+      const bodyStr = typeof data === 'string' ? data : JSON.stringify(data);
+      return {
+        status,
+        headers: { get: (k) => (k.toLowerCase() === 'content-length' ? String(Buffer.byteLength(bodyStr, 'utf8')) : null) },
+        text: async () => bodyStr
+      };
+    };
+
+    const remoteSessionFetch = async (url, init = {}) => {
+      sessionFetchCalls++;
+      if (url.endsWith('/')) {
+        return makeJsonRes(`<script>window.__APP_CONFIG__ = ${JSON.stringify({ csrfToken: null, appVersion: '2.35.2' })};</script>`);
+      }
+      if (init.headers?.['x-codeium-csrf-token'] !== remoteToken) {
+        return makeJsonRes('unauthorized', 401);
+      }
+      const method = url.split('/').pop();
+      const parsed = JSON.parse(init.body || '{}');
+      if (method === 'GetCascadeTrajectory') {
+        assert.equal(parsed.cascadeId, remoteCascadeId);
+        return makeJsonRes({
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          lastModifiedTime: todayIso,
+          numTotalSteps: 2,
+          numTotalGeneratorMetadata: 1,
+          trajectory: {
+            steps: [
+              { userInput: { userResponse: 'Remote SSH prompt' }, metadata: { createdAt: todayIso } },
+              { plannerResponse: { response: 'Remote reply' }, metadata: { createdAt: todayIso, completedAt: todayIso } }
+            ],
+            generatorMetadata: [
+              {
+                invocationId: 'remote-call-1',
+                stepIndices: [1],
+                chatModel: {
+                  modelDisplayName: 'Claude Opus 4.5 (Remote)',
+                  timeToFirstToken: '0.3s',
+                  streamingDuration: '1.2s',
+                  usage: { inputTokens: 1500, cacheReadTokens: 8000, outputTokens: 250 },
+                  chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 200000 } }
+                }
+              }
+            ]
+          }
+        });
+      }
+      if (method === 'GetAllCascadeTrajectories') {
+        return makeJsonRes({
+          trajectorySummaries: {
+            [remoteCascadeId]: { status: 'CASCADE_RUN_STATUS_IDLE', stepCount: 2, createdTime: todayIso, lastModifiedTime: todayIso }
+          }
+        });
+      }
+      if (method === 'GetCascadeTrajectorySteps') {
+        return makeJsonRes({
+          steps: [
+            { userInput: { userResponse: 'Remote SSH prompt' }, metadata: { createdAt: todayIso } },
+            { plannerResponse: { response: 'Remote reply' }, metadata: { createdAt: todayIso, completedAt: todayIso } }
+          ]
+        });
+      }
+      if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+        return makeJsonRes({
+          numTotalGeneratorMetadata: 1,
+          generatorMetadata: [
+            {
+              invocationId: 'remote-call-1',
+              stepIndices: [1],
+              chatModel: {
+                modelDisplayName: 'Claude Opus 4.5 (Remote)',
+                timeToFirstToken: '0.3s',
+                streamingDuration: '1.2s',
+                usage: { inputTokens: 1500, cacheReadTokens: 8000, outputTokens: 250 },
+                chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 200000 } }
+              }
+            }
+          ]
+        });
+      }
+      if (method === 'RetrieveUserQuotaSummary') {
+        return makeJsonRes({
+          response: {
+            groups: [
+              {
+                displayName: 'Claude / GPT',
+                buckets: [
+                  { bucketId: 'cg-5h', window: '5h', remainingFraction: 0.6, resetTime: new Date(Date.now() + 1800 * 1000).toISOString() },
+                  { bucketId: 'cg-weekly', window: 'weekly', remainingFraction: 0.85, resetTime: new Date(Date.now() + 7200 * 1000).toISOString() }
+                ]
+              }
+            ]
+          }
+        });
+      }
+      return makeJsonRes({});
+    };
+
+    const remoteOpts = {
+      force: true,
+      stateDir: tmpDir,
+      isRemote: true,
+      originScopeKey: 'ssh:gpu-box-1',
+      sessionFetch: remoteSessionFetch,
+      resolveRendererCsrfToken: async () => remoteToken,
+      remoteTokenRetryMs: 0
+    };
+
+    // Use exact same origin string as local server to verify isolation + unified ledger merge
+    const localRes = await collect(origin, cascadeId, { force: true, stateDir: tmpDir });
+    const remoteRes = await collect(origin, remoteCascadeId, remoteOpts);
+    assert.equal(localRes.sessionTotals.totalTokens, 20300);
+    assert.equal(remoteRes.conversation, remoteCascadeId);
+    assert.equal(remoteRes.sessionTotals.callCount, 1);
+    assert.equal(remoteRes.sessionTotals.totalTokens, 9750);
+    assert.equal(remoteRes.latest.actual, 9750);
+    assert.ok(sessionFetchCalls > 0);
+
+    // 401 refresh re-reads renderer token on remote
+    remoteToken = 'remote-tok-2';
+    const remoteTs = await collectTurnState(origin, remoteCascadeId, remoteOpts);
+    assert.equal(remoteTs.latest.actual, 9750);
+
+    const remoteQuota = await collectQuotaSummary(origin, remoteOpts);
+    assert.equal(remoteQuota.groups[0].fiveHour.remainingPct, 60);
+    assert.equal(remoteQuota.groups[0].weekly.remainingPct, 85);
+
+    // Daily usage collects from remote AND includes previously synced local + remote conversations in unified ledger
+    const unifiedDaily = await collectDailyUsage(origin, remoteOpts);
+    assert.equal(unifiedDaily.today.totalTokens, 20300 + 9750);
+    assert.equal(unifiedDaily.today.callCount, 4);
+    assert.ok(unifiedDaily.modelsByScope.today.some(m => m.model === 'Gemini Pro'));
+    assert.ok(unifiedDaily.modelsByScope.today.some(m => m.model === 'Claude Opus 4.5 (Remote)'));
+
+    // Re-scanning local daily usage also preserves remote entry without conflict
+    const localDaily = await collectDailyUsage(origin, { force: true, stateDir: tmpDir });
+    assert.equal(localDaily.today.totalTokens, 20300 + 3100 + 9750);
+  });
+
+  it('maps SSH tunnel proxy errors cleanly and blocks local fallback for remote sessions', async () => {
+    await assert.rejects(
+      () => collect(origin, cascadeId, { isRemote: true, originScopeKey: 'ssh:no-fetch', stateDir: tmpDir }),
+      /SSH 远端会话网络通道不可用/
+    );
+
+    await assert.rejects(
+      () => collect(origin, cascadeId, {
+        isRemote: true,
+        originScopeKey: 'ssh:dropped',
+        sessionFetch: async () => { throw new Error('net::ERR_PROXY_CONNECTION_FAILED'); },
+        remoteTokenRetryMs: 0,
+        stateDir: tmpDir
+      }),
+      /SSH 远端连接暂时不可用（ERR_PROXY_CONNECTION_FAILED）/
+    );
+  });
+
+  it('detects remote Electron sessions in meter-main IPC handlers', async () => {
+    const handlers = new Map();
+    const fakeIpcMain = {
+      handle: (ch, fn) => handlers.set(ch, fn),
+      removeHandler: (ch) => handlers.delete(ch)
+    };
+    const defaultSes = { name: 'default' };
+    const sshSes = {
+      name: 'persist:ssh-host1',
+      fetch: async (url, init) => {
+        assert.equal(init.headers['x-codeium-csrf-token'], 'ssh-page-tok');
+        assert.ok(url.endsWith('/RetrieveUserQuotaSummary'));
+        return {
+          status: 200,
+          headers: { get: () => null },
+          text: async () => JSON.stringify({
+            response: {
+              groups: [{
+                displayName: 'Gemini',
+                buckets: [{ window: '5h', remainingFraction: 0.9, resetTime: new Date(Date.now() + 60000).toISOString() }]
+              }]
+            }
+          })
+        };
+      }
+    };
+
+    registerMeterIpcHandlers(fakeIpcMain, {
+      defaultSession: defaultSes,
+      resolveRemoteBackend: (sender) => (sender?.id === 42 ? { kind: 'ssh', hostId: 'gpu-box', label: 'gpu-box' } : null)
+    });
+
+    const remoteEvent = {
+      senderFrame: { url: 'https://127.0.0.1:34217/' },
+      sender: {
+        id: 42,
+        session: sshSes,
+        isDestroyed: () => false,
+        executeJavaScript: async () => 'ssh-page-tok'
+      }
+    };
+    const localEvent = {
+      senderFrame: { url: 'https://127.0.0.1:52621/' },
+      sender: {
+        id: 7,
+        session: defaultSes,
+        isDestroyed: () => false,
+        executeJavaScript: async () => 'local-tok'
+      }
+    };
+
+    const rtRemote = await handlers.get('context-meter:runtime-info')(remoteEvent);
+    assert.equal(rtRemote.isRemote, true);
+    assert.equal(rtRemote.remoteHost, 'gpu-box');
+
+    const rtLocal = await handlers.get('context-meter:runtime-info')(localEvent);
+    assert.equal(rtLocal.isRemote, false);
+    assert.equal(rtLocal.remoteHost, null);
+
+    const { opts: localOpts } = buildCollectorOptions(localEvent, {}, { defaultSession: defaultSes, resolveRemoteBackend: () => null });
+    assert.equal(localOpts.isRemote, undefined);
+    assert.equal(typeof localOpts.sessionFetch, 'undefined');
+
+    const quotaRes = await handlers.get('context-meter:quota')(remoteEvent, true);
+    assert.equal(quotaRes.ok, true);
+    assert.equal(quotaRes.groups[0].fiveHour.remainingPct, 90);
   });
 });

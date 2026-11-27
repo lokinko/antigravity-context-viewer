@@ -6,16 +6,20 @@
 const fs = require('fs');
 const path = require('path');
 let ipcMain = null;
+let electronSession = null;
 try {
   const electron = require('electron');
   if (electron && typeof electron === 'object') {
     ipcMain = electron.ipcMain;
+    electronSession = electron.session || null;
   }
 } catch {}
 
 const { normalizeLoopbackOrigin } = require('./local-api');
 const { getProjectVersion } = require('./meter-storage');
 const { collect, collectTurnState, collectDailyUsage, collectQuotaSummary, getSettings, saveSettings } = require('./meter-collector');
+
+const RENDERER_CSRF_EXPR = '(() => { try { const a = window.__APP_CONFIG__ && window.__APP_CONFIG__.csrfToken; if (typeof a === "string" && a.trim()) return a.trim(); const b = window.localStorage && window.localStorage.getItem("agy_session_csrf_token"); return typeof b === "string" ? b.trim() : ""; } catch { return ""; } })()';
 
 const PROJECT_VERSION = getProjectVersion('1.0.0');
 const MAIN_STARTED_AT = Date.now();
@@ -62,6 +66,51 @@ function isLocalMainFrameSender(event) {
   }
 }
 
+function resolveHostRemoteBackend(sender) {
+  try {
+    if (!sender) return null;
+    const mod = require('./remote/windowBackends');
+    if (mod && typeof mod.remoteBackendOf === 'function') {
+      return mod.remoteBackendOf(sender) || null;
+    }
+  } catch {}
+  return null;
+}
+
+function buildCollectorOptions(event, extraOptions = {}, deps = {}) {
+  const sender = event?.sender || null;
+  const senderSession = sender?.session || null;
+  const remoteBackend = typeof deps.resolveRemoteBackend === 'function'
+    ? deps.resolveRemoteBackend(sender)
+    : resolveHostRemoteBackend(sender);
+  const defaultSession = deps.defaultSession !== undefined ? deps.defaultSession : (electronSession?.defaultSession || null);
+  const isRemote = Boolean(remoteBackend || (senderSession && defaultSession && senderSession !== defaultSession));
+  const originScopeKey = isRemote
+    ? (remoteBackend?.hostId ? `ssh:${remoteBackend.hostId}` : (typeof sender?.id === 'number' ? `remote-wc:${sender.id}` : 'remote'))
+    : '';
+
+  const opts = { ...extraOptions };
+  if (isRemote) {
+    opts.isRemote = true;
+    opts.originScopeKey = originScopeKey;
+    if (senderSession && typeof senderSession.fetch === 'function') {
+      opts.sessionFetch = (url, init) => senderSession.fetch(url, init);
+    }
+  }
+  if (sender && !sender.isDestroyed?.() && typeof sender.executeJavaScript === 'function') {
+    opts.resolveRendererCsrfToken = async () => {
+      try {
+        if (sender.isDestroyed?.()) return '';
+        const tok = await sender.executeJavaScript(RENDERER_CSRF_EXPR);
+        return typeof tok === 'string' ? tok.trim() : '';
+      } catch {
+        return '';
+      }
+    };
+  }
+  return { opts, isRemote, remoteHost: remoteBackend?.label || null };
+}
+
 function getMeterSource() {
   const key = __dirname;
   if (meterSourceCache.has(key)) return meterSourceCache.get(key);
@@ -76,7 +125,7 @@ function clearMeterSourceCacheForTest() {
   meterSourceCache.clear();
 }
 
-function registerMeterIpcHandlers(targetIpcMain = ipcMain) {
+function registerMeterIpcHandlers(targetIpcMain = ipcMain, deps = {}) {
   if (!targetIpcMain || typeof targetIpcMain.handle !== 'function') return false;
   if (targetIpcMain === ipcMain && ipcRegistered) return true;
   if (targetIpcMain === ipcMain) ipcRegistered = true;
@@ -89,6 +138,7 @@ function registerMeterIpcHandlers(targetIpcMain = ipcMain) {
   targetIpcMain.handle('context-meter:runtime-info', (event) => {
     const origin = isLocalMainFrameSender(event);
     if (!origin) throw new Error('仅允许本机主聊天窗口');
+    const ctx = buildCollectorOptions(event, {}, deps);
     return {
       ok: true,
       backendVersion: PROJECT_VERSION,
@@ -96,6 +146,8 @@ function registerMeterIpcHandlers(targetIpcMain = ipcMain) {
       pid: process.pid,
       startedAt: MAIN_STARTED_AT,
       origin,
+      isRemote: Boolean(ctx.isRemote),
+      remoteHost: ctx.remoteHost,
       capabilities: { ...MAIN_CAPABILITIES }
     };
   });
@@ -104,28 +156,32 @@ function registerMeterIpcHandlers(targetIpcMain = ipcMain) {
   targetIpcMain.handle('context-meter:scan', async (event, id, force = false) => {
     const origin = isLocalMainFrameSender(event);
     if (!origin) throw new Error('仅允许本机主聊天窗口');
-    return collect(origin, id, { force: force === true, supersedePrevious: true });
+    const { opts } = buildCollectorOptions(event, { force: force === true, supersedePrevious: true }, deps);
+    return collect(origin, id, opts);
   });
 
   remove('context-meter:turn-state');
   targetIpcMain.handle('context-meter:turn-state', async (event, id) => {
     const origin = isLocalMainFrameSender(event);
     if (!origin) throw new Error('仅允许本机主聊天窗口');
-    return collectTurnState(origin, id);
+    const { opts } = buildCollectorOptions(event, {}, deps);
+    return collectTurnState(origin, id, opts);
   });
 
   remove('context-meter:daily-usage');
   targetIpcMain.handle('context-meter:daily-usage', async (event, force = false) => {
     const origin = isLocalMainFrameSender(event);
     if (!origin) throw new Error('仅允许本机主聊天窗口');
-    return collectDailyUsage(origin, { force: force === true });
+    const { opts } = buildCollectorOptions(event, { force: force === true }, deps);
+    return collectDailyUsage(origin, opts);
   });
 
   remove('context-meter:quota');
   targetIpcMain.handle('context-meter:quota', async (event, force = false) => {
     const origin = isLocalMainFrameSender(event);
     if (!origin) throw new Error('仅允许本机主聊天窗口');
-    return collectQuotaSummary(origin, { force: force === true });
+    const { opts } = buildCollectorOptions(event, { force: force === true }, deps);
+    return collectQuotaSummary(origin, opts);
   });
 
   remove('context-meter:get-settings');
@@ -245,6 +301,7 @@ module.exports = {
   installContextMeter,
   ensureMeterInjected,
   registerMeterIpcHandlers,
+  buildCollectorOptions,
   isLocalMainFrameSender,
   getWindowWebContents,
   getMeterSource,

@@ -59,6 +59,13 @@ let collectTaskSeq = 0;
 const _httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, rejectUnauthorized: false });
 const _httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8 });
 
+const MAX_RESPONSE_BYTES = 96 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 20000;
+
+function getOriginScopeKey(origin, options = {}) {
+  return options?.originScopeKey ? `${String(options.originScopeKey)}|${origin}` : origin;
+}
+
 function setBoundedMap(map, key, val, maxEntries) {
   if (map.has(key)) map.delete(key);
   map.set(key, val);
@@ -68,13 +75,135 @@ function setBoundedMap(map, key, val, maxEntries) {
   }
 }
 
-function request(origin, method, body, token, signal = null) {
+function createAbortError() {
+  const err = new Error('请求已取消');
+  err.name = 'AbortError';
+  return err;
+}
+
+function sleepWithAbort(ms, signal = null) {
+  if (!(ms > 0)) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      reject(createAbortError());
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+}
+
+function mapRemoteTransportError(err, isRemote) {
+  if (!isRemote || !err) return err;
+  const msg = String(err?.message || err || '');
+  const m = msg.match(/\b(ERR_PROXY_CONNECTION_FAILED|ERR_SOCKS_CONNECTION_FAILED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_BLOCKED_BY_CLIENT|ERR_TUNNEL_CONNECTION_FAILED)\b/);
+  if (m) {
+    return new Error(`SSH 远端连接暂时不可用（${m[1]}），请等待重连后重试`);
+  }
+  return err;
+}
+
+async function readSessionFetchText(res, isRemote) {
+  const sizeErrMsg = isRemote ? 'SSH 远端响应过大，扫描中止' : '本地响应过大，扫描中止';
+  const rawLen = typeof res.headers?.get === 'function' ? Number(res.headers.get('content-length')) : NaN;
+  if (Number.isFinite(rawLen) && rawLen > MAX_RESPONSE_BYTES) {
+    try { await res.body?.cancel?.(); } catch {}
+    throw new Error(sizeErrMsg);
+  }
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          totalBytes += buf.byteLength;
+          if (totalBytes > MAX_RESPONSE_BYTES) {
+            try { await reader.cancel(); } catch {}
+            throw new Error(sizeErrMsg);
+          }
+          chunks.push(buf);
+        }
+      }
+    } finally {
+      try { reader.releaseLock?.(); } catch {}
+    }
+    return Buffer.concat(chunks, totalBytes).toString('utf8');
+  }
+  const text = typeof res.text === 'function' ? await res.text() : '';
+  if (Buffer.byteLength(String(text || ''), 'utf8') > MAX_RESPONSE_BYTES) {
+    throw new Error(sizeErrMsg);
+  }
+  return String(text || '');
+}
+
+async function requestViaSessionFetch(sessionFetch, url, method, body, token, signal = null, isRemote = false) {
+  if (signal?.aborted) throw createAbortError();
+  const timeoutCtrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    timeoutCtrl.abort();
+  }, REQUEST_TIMEOUT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  const onExtAbort = () => timeoutCtrl.abort();
+  signal?.addEventListener?.('abort', onExtAbort, { once: true });
+
+  try {
+    const res = await sessionFetch(url, {
+      method: method ? 'POST' : 'GET',
+      headers: method ? { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': token } : {},
+      ...(method ? { body: JSON.stringify(body) } : {}),
+      signal: timeoutCtrl.signal,
+      redirect: 'manual'
+    });
+    if (signal?.aborted) throw createAbortError();
+    if (!res || typeof res.status !== 'number') {
+      throw new Error(isRemote ? 'SSH 远端接口未返回有效响应' : '本机接口未返回有效响应');
+    }
+    if (res.status !== 200) {
+      try { await res.body?.cancel?.(); } catch {}
+      throw new Error(`${isRemote ? 'SSH 远端接口' : '本机接口'} HTTP ${res.status}`);
+    }
+    const text = await readSessionFetchText(res, isRemote);
+    if (signal?.aborted) throw createAbortError();
+    return method ? JSON.parse(text) : text;
+  } catch (err) {
+    if (signal?.aborted || (err?.name === 'AbortError' && !timedOut)) {
+      throw createAbortError();
+    }
+    if (timedOut) {
+      throw new Error(isRemote ? 'SSH 远端接口读取超时' : '本机接口读取超时');
+    }
+    throw mapRemoteTransportError(err, isRemote);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener?.('abort', onExtAbort);
+  }
+}
+
+function request(origin, method, body, token, signal = null, options = {}) {
   const url = method ? `${origin}/exa.language_server_pb.LanguageServerService/${method}` : origin + '/';
+  const isRemote = options?.isRemote === true;
+  if (isRemote && typeof options?.sessionFetch !== 'function') {
+    return Promise.reject(new Error('SSH 远端会话网络通道不可用，请重试或重新连接 SSH'));
+  }
+  if (typeof options?.sessionFetch === 'function') {
+    return requestViaSessionFetch(options.sessionFetch, url, method, body, token, signal, isRemote);
+  }
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      const err = new Error('请求已取消');
-      err.name = 'AbortError';
-      reject(err);
+      reject(createAbortError());
       return;
     }
     const isHttps = url.startsWith('https:');
@@ -90,7 +219,7 @@ function request(origin, method, body, token, signal = null) {
       let size = 0;
       response.on('data', chunk => {
         size += chunk.length;
-        if (size > 96 * 1024 * 1024) {
+        if (size > MAX_RESPONSE_BYTES) {
           req.destroy(new Error('本地响应过大，扫描中止'));
           return;
         }
@@ -98,9 +227,7 @@ function request(origin, method, body, token, signal = null) {
       });
       response.on('end', () => {
         if (signal?.aborted) {
-          const err = new Error('请求已取消');
-          err.name = 'AbortError';
-          reject(err);
+          reject(createAbortError());
           return;
         }
         const text = Buffer.concat(chunks).toString('utf8');
@@ -115,18 +242,29 @@ function request(origin, method, body, token, signal = null) {
         }
       });
     });
-    req.setTimeout(20000, () => req.destroy(new Error('本机接口读取超时')));
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('本机接口读取超时')));
     req.on('error', reject);
     req.end(method ? JSON.stringify(body) : undefined);
   });
 }
 
 async function resolveCollectCsrfToken(origin, signal = null, options = {}, isSuperseded = null) {
+  const isRemote = options?.isRemote === true;
+  const readRendererToken = typeof options?.resolveRendererCsrfToken === 'function' ? options.resolveRendererCsrfToken : null;
+
+  if (isRemote && readRendererToken) {
+    try {
+      const rendererToken = String((await readRendererToken()) || '').trim();
+      if (typeof isSuperseded === 'function' && isSuperseded()) return '';
+      if (rendererToken) return rendererToken;
+    } catch {}
+  }
+
   let token = '';
   let hasConfig = false;
   let htmlFetchErr = null;
   try {
-    const html = await request(origin, null, null, null, signal);
+    const html = await request(origin, null, null, null, signal, options);
     if (typeof isSuperseded === 'function' && isSuperseded()) return '';
     const match = String(html || '').match(/window\.__APP_CONFIG__\s*=\s*(\{.*?\})\s*;/s);
     if (match) {
@@ -139,8 +277,21 @@ async function resolveCollectCsrfToken(origin, signal = null, options = {}, isSu
     htmlFetchErr = err;
   }
 
+  if (!token && isRemote && readRendererToken) {
+    const retryMs = Number.isFinite(Number(options?.remoteTokenRetryMs)) ? Math.max(0, Number(options.remoteTokenRetryMs)) : 250;
+    if (retryMs > 0) {
+      await sleepWithAbort(retryMs, signal);
+    }
+    if (typeof isSuperseded === 'function' && isSuperseded()) return '';
+    try {
+      const retryToken = String((await readRendererToken()) || '').trim();
+      if (typeof isSuperseded === 'function' && isSuperseded()) return '';
+      if (retryToken) return retryToken;
+    } catch {}
+  }
+
   const canFallback = !htmlFetchErr || /HTTP 40[13]\b/.test(String(htmlFetchErr.message || ''));
-  if (!token && canFallback) {
+  if (!token && !isRemote && canFallback) {
     try {
       const fallbackToken = resolveOriginCsrfToken(origin, options);
       if (fallbackToken) {
@@ -150,29 +301,49 @@ async function resolveCollectCsrfToken(origin, signal = null, options = {}, isSu
     } catch {}
   }
 
+  if (!token && !isRemote && readRendererToken && canFallback) {
+    try {
+      const localRendererToken = String((await readRendererToken()) || '').trim();
+      if (typeof isSuperseded === 'function' && isSuperseded()) return '';
+      if (localRendererToken) {
+        token = localRendererToken;
+        hasConfig = true;
+      }
+    } catch {}
+  }
+
   if (!token && htmlFetchErr) throw htmlFetchErr;
-  if (!hasConfig) throw new Error('Antigravity 本地连接信息尚未就绪，请稍后重试');
-  if (!token) throw new Error('Antigravity 本地鉴权信息尚未就绪，请稍后重试');
+  if (!hasConfig) {
+    throw new Error(isRemote ? 'SSH 远端连接信息尚未就绪，请稍后重试' : 'Antigravity 本地连接信息尚未就绪，请稍后重试');
+  }
+  if (!token) {
+    throw new Error(isRemote ? 'SSH 远端鉴权信息尚未就绪，请稍后重试' : 'Antigravity 本地鉴权信息尚未就绪，请稍后重试');
+  }
   return token;
 }
 
 function createOriginCaller(origin, signal = null, options = {}, isSuperseded = null) {
+  const scopeKey = getOriginScopeKey(origin, options);
+  const isRemote = options?.isRemote === true;
   return async (method, body) => {
-    let token = csrfTokenByOrigin.get(origin) || null;
+    let token = csrfTokenByOrigin.get(scopeKey) || null;
     if (!token) {
       token = await resolveCollectCsrfToken(origin, signal, options, isSuperseded);
       if (typeof isSuperseded === 'function' && isSuperseded()) return null;
-      csrfTokenByOrigin.set(origin, token);
+      csrfTokenByOrigin.set(scopeKey, token);
     }
     try {
-      return await request(origin, method, body, token, signal);
+      return await request(origin, method, body, token, signal, options);
     } catch (err) {
       if (err && /HTTP 40[13]/.test(String(err.message || '')) && !signal?.aborted) {
-        csrfTokenByOrigin.delete(origin);
+        csrfTokenByOrigin.delete(scopeKey);
         token = await resolveCollectCsrfToken(origin, signal, options, isSuperseded);
         if (typeof isSuperseded === 'function' && isSuperseded()) return null;
-        csrfTokenByOrigin.set(origin, token);
-        return await request(origin, method, body, token, signal);
+        csrfTokenByOrigin.set(scopeKey, token);
+        return await request(origin, method, body, token, signal, options);
+      }
+      if (isRemote && err?.name !== 'AbortError' && !signal?.aborted) {
+        csrfTokenByOrigin.delete(scopeKey);
       }
       throw err;
     }
@@ -572,7 +743,8 @@ function recordCallsToLedger(calls = [], options = {}) {
 async function collectDailyUsage(origin = null, options = {}) {
   const { path: ledgerPath, data: ledger, migrated } = loadLedger(options);
   const safeOrigin = origin ? normalizeLoopbackOrigin(origin) : null;
-  const syncKey = `${safeOrigin || ''}|${ledgerPath}`;
+  const scopeKey = safeOrigin ? getOriginScopeKey(safeOrigin, options) : '';
+  const syncKey = `${scopeKey}|${ledgerPath}`;
   const lastSync = _lastDailySyncAt.get(syncKey) || 0;
   const shouldSyncHost = Boolean(safeOrigin && (options.force === true || migrated || Date.now() - lastSync > DAILY_SYNC_TTL_MS));
 
@@ -741,20 +913,21 @@ async function collect(origin, id, options = {}) {
     throw new Error('无效本机会话');
   }
   origin = safeOrigin;
-  const key = `${origin}/${id}`;
+  const scopeKey = getOriginScopeKey(origin, options);
+  const key = `${scopeKey}/${id}`;
   const supersede = options.supersedePrevious === true;
   const mySeq = supersede ? (++collectSeqCounter) : 0;
   const abortController = supersede ? new AbortController() : null;
   if (supersede) {
-    const prevLatest = latestCollectSeqByOrigin.get(origin);
+    const prevLatest = latestCollectSeqByOrigin.get(scopeKey);
     if (prevLatest && prevLatest.id !== id && prevLatest.abortController) {
       try { prevLatest.abortController.abort(); } catch {}
     }
-    latestCollectSeqByOrigin.set(origin, { seq: mySeq, id, abortController });
+    latestCollectSeqByOrigin.set(scopeKey, { seq: mySeq, id, abortController });
   }
   const isSuperseded = () => {
     if (!supersede) return false;
-    const latest = latestCollectSeqByOrigin.get(origin);
+    const latest = latestCollectSeqByOrigin.get(scopeKey);
     return Boolean((latest && latest.seq > mySeq && latest.id !== id) || abortController?.signal?.aborted);
   };
 
@@ -781,7 +954,7 @@ async function collect(origin, id, options = {}) {
       const trajectory = full.trajectory || {};
       const session = analyzeSteps(steps);
       const title = String(full.title || trajectory.title || full.metadata?.title || trajectory.metadata?.title || session.firstUserTitle || inc?.title || '').trim();
-      _turnStateGmCountCache.set(`${origin}|${id.toLowerCase()}`, gmRows.length);
+      _turnStateGmCountCache.set(`${scopeKey}|${id.toLowerCase()}`, gmRows.length);
 
       const fallbackDate = full.lastModifiedTime || full.createdTime || trajectory.metadata?.createdAt || inc?.fallbackDate || new Date().toISOString();
       const resolved = resolveLatestAndCalls(gmRows, id, session, { steps, fallbackDate });
@@ -927,8 +1100,9 @@ async function collectTurnState(origin, id, options = {}) {
     throw new Error('无效本机会话');
   }
   origin = safeOrigin;
+  const scopeKey = getOriginScopeKey(origin, options);
   const call = createOriginCaller(origin, null, options, () => false);
-  const gmCacheKey = `${origin}|${id.toLowerCase()}`;
+  const gmCacheKey = `${scopeKey}|${id.toLowerCase()}`;
 
   let summaryEntry = null;
   try {
@@ -1052,7 +1226,8 @@ async function collectQuotaSummary(origin, options = {}) {
   if (!safeOrigin) {
     throw new Error('无效本机服务地址');
   }
-  const cached = _quotaCache.get(safeOrigin);
+  const scopeKey = getOriginScopeKey(safeOrigin, options);
+  const cached = _quotaCache.get(scopeKey);
   if (options.force !== true && cached && (Date.now() - cached.at) < QUOTA_TTL_MS) {
     return cached.data;
   }
@@ -1064,7 +1239,7 @@ async function collectQuotaSummary(origin, options = {}) {
     version: PROJECT_VERSION,
     ...parsed
   };
-  setBoundedMap(_quotaCache, safeOrigin, { data: result, at: Date.now() }, 16);
+  setBoundedMap(_quotaCache, scopeKey, { data: result, at: Date.now() }, 16);
   return result;
 }
 
